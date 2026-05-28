@@ -1,0 +1,243 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>L2LLM 股票AI行情</title>
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <h1>L2LLM 股票AI行情</h1>
+          <p id="providerLine">行情加载中</p>
+        </div>
+        <form id="symbolForm" class="controls">
+          <label>
+            <span>股票</span>
+            <input id="symbolInput" value="600519" placeholder="600519 / AAPL" autocomplete="off" spellcheck="false">
+          </label>
+          <label>
+            <span>周期</span>
+            <select id="rangeSelect">
+              <option value="1d">日内</option>
+              <option value="5d">5日</option>
+              <option value="1mo">1月</option>
+              <option value="3mo">3月</option>
+              <option value="6mo">6月</option>
+              <option value="ytd">YTD</option>
+              <option value="1y">1年</option>
+              <option value="3y">3Y</option>
+              <option value="5y">5Y</option>
+              <option value="10y">10Y</option>
+              <option value="all">ALL</option>
+            </select>
+          </label>
+          <label>
+            <span>K线</span>
+            <select id="intervalSelect">
+              <option value="1m">1m</option>
+              <option value="5m">5m</option>
+              <option value="15m">15m</option>
+              <option value="30m">30m</option>
+              <option value="60m">60m</option>
+              <option value="1d">1d</option>
+              <option value="1wk">week</option>
+              <option value="1mo">1 month</option>
+              <option value="3mo">3 month</option>
+              <option value="6mo">6 month</option>
+            </select>
+          </label>
+          <button type="submit">刷新</button>
+        </form>
+      </header>
+
+      <section class="quote-grid">
+        <article class="quote-tile primary">
+          <span>最新价</span>
+          <strong id="lastPrice">--</strong>
+          <em id="changeValue">--</em>
+        </article>
+        <article class="quote-tile">
+          <span>开盘</span>
+          <strong id="openPrice">--</strong>
+        </article>
+        <article class="quote-tile">
+          <span>最高 / 最低</span>
+          <strong id="highLow">--</strong>
+        </article>
+        <article class="quote-tile">
+          <span>成交量</span>
+          <strong id="volumeValue">--</strong>
+        </article>
+      </section>
+
+      <section class="portfolio-panel collapsed" id="portfolioPanel">
+        <div class="panel-title">
+          <h2>实时仓位</h2>
+          <div class="portfolio-tools">
+            <select id="portfolioMarket">
+              <option value="all">全部市场</option>
+              <option value="cn">中国</option>
+              <option value="us">美国</option>
+              <option value="hk">香港</option>
+            </select>
+            <span id="portfolioUpdated">--</span>
+            <button id="portfolioToggle" class="ghost-button" type="button" aria-expanded="false">å±•å¼€</button>
+          </div>
+        </div>
+        <div id="marketBreakdown" class="market-breakdown"></div>
+        <div class="portfolio-summary">
+          <div><span>总市值</span><strong id="portfolioValue">--</strong></div>
+          <div><span>浮动盈亏</span><strong id="portfolioPnl">--</strong></div>
+          <div><span>总体收益率</span><strong id="portfolioReturn">--</strong></div>
+          <div><span>持仓 / 交易</span><strong id="portfolioCounts">--</strong></div>
+        </div>
+        <div class="portfolio-content" id="portfolioContent">
+        <form id="tradeForm" class="trade-form">
+          <select id="tradeMarket">
+            <option value="cn">中国</option>
+            <option value="us">美国</option>
+            <option value="hk">香港</option>
+          </select>
+          <input id="tradeSymbol" placeholder="股票 600519" autocomplete="off">
+          <select id="tradeSide">
+            <option value="buy">买入</option>
+            <option value="sell">卖出</option>
+          </select>
+          <input id="tradeQuantity" type="number" min="0" step="100" placeholder="数量">
+          <input id="tradePrice" type="number" min="0" step="0.01" placeholder="成交价">
+          <input id="tradeTakeProfit" type="number" min="0" step="0.01" placeholder="止盈价">
+          <input id="tradeStopLoss" type="number" min="0" step="0.01" placeholder="止损价">
+          <button type="submit">记一笔</button>
+        </form>
+        <div class="portfolio-columns">
+          <div>
+            <h3>个股持仓情况</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>市场</th><th>股票</th><th>数量</th><th>成本</th><th>现价</th><th>收益率</th><th>仓位</th></tr>
+                </thead>
+                <tbody id="positionRows"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <h3>交易止盈 / 止损</h3>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>市场</th><th>股票</th><th>方向</th><th>成交价</th><th>现价</th><th>止盈</th><th>止损</th></tr>
+                </thead>
+                <tbody id="tradeRows"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+        </div>
+      </section>
+
+      <section class="workspace">
+        <section class="chart-panel">
+          <div class="panel-title">
+            <h2>K线趋势</h2>
+            <span id="statusBadge">连接中</span>
+          </div>
+          <canvas id="klineCanvas" width="1100" height="520"></canvas>
+          <div class="second-chart-panel">
+            <div class="panel-title compact-title">
+              <h3>当日秒级实时行情</h3>
+              <span id="secondSource">--</span>
+            </div>
+            <div class="second-stats">
+              <strong id="secondPrice">--</strong>
+              <span id="secondChange">--</span>
+              <span id="secondCount">0 ticks</span>
+            </div>
+            <canvas id="secondCanvas" width="1100" height="180"></canvas>
+          </div>
+        </section>
+
+        <aside class="side-panel">
+          <section class="depth-panel">
+            <div class="panel-title">
+              <h2>盘口</h2>
+              <span id="depthSource">--</span>
+            </div>
+            <div class="book-head">
+              <span>买盘</span>
+              <span>卖盘</span>
+            </div>
+            <div class="order-book">
+              <div id="bids"></div>
+              <div id="asks"></div>
+            </div>
+            <div id="bookNote" class="note"></div>
+          </section>
+
+          <section class="ai-panel">
+            <div class="panel-title">
+              <h2>AI判断</h2>
+              <span id="engineName">--</span>
+            </div>
+            <div id="openaiNotice" class="openai-notice" hidden></div>
+            <div id="directionPill" class="direction neutral">--</div>
+            <p id="summaryText">等待行情数据。</p>
+            <dl class="metrics">
+              <div><dt>置信度</dt><dd id="confidence">--</dd></div>
+              <div><dt>RSI</dt><dd id="rsi">--</dd></div>
+              <div><dt>量能</dt><dd id="volumeRatio">--</dd></div>
+              <div><dt>支撑 / 压力</dt><dd id="sr">--</dd></div>
+              <div><dt>主力吸筹</dt><dd id="mainAccumulation">--</dd></div>
+              <div><dt>游资点火</dt><dd id="hotMoneyIgnition">--</dd></div>
+              <div><dt>主图MACD</dt><dd id="mainChartMacd">--</dd></div>
+              <div><dt>秒级MACD</dt><dd id="secondsMacd">--</dd></div>
+              <div><dt>DDE资金流</dt><dd id="ddeFlow">--</dd></div>
+              <div><dt>诱多风险</dt><dd id="bullTrap">--</dd></div>
+              <div><dt>封板概率</dt><dd id="limitUpProbability">--</dd></div>
+              <div><dt>风险等级</dt><dd id="riskLevel">--</dd></div>
+              <div><dt>K线趋势</dt><dd id="klineTrend">--</dd></div>
+              <div><dt>K线形态</dt><dd id="klinePattern">--</dd></div>
+            </dl>
+            <div class="lists">
+              <div>
+                <h3>依据</h3>
+                <ul id="reasonList"></ul>
+              </div>
+              <div>
+                <h3>风险</h3>
+                <ul id="riskList"></ul>
+              </div>
+            </div>
+            <div class="third-party-ai">
+              <div class="panel-title compact-title">
+                <h3>第三方API判断</h3>
+                <span id="thirdPartyEngine">--</span>
+              </div>
+              <div id="thirdPartyNotice" class="openai-notice" hidden></div>
+              <div id="thirdPartyDirection" class="direction neutral">--</div>
+              <dl class="metrics third-party-metrics">
+                <div><dt>置信度</dt><dd id="thirdPartyConfidence">--</dd></div>
+              </dl>
+              <p id="thirdPartySummary">等待第三方API返回。</p>
+              <div class="lists">
+                <div>
+                  <h3>依据</h3>
+                  <ul id="thirdPartyReasons"></ul>
+                </div>
+                <div>
+                  <h3>风险</h3>
+                  <ul id="thirdPartyRisks"></ul>
+                </div>
+              </div>
+            </div>
+          </section>
+        </aside>
+      </section>
+    </main>
+
+    <script src="/app.js" type="module"></script>
+  </body>
+</html>

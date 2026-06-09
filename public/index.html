@@ -157,6 +157,11 @@
               <span id="secondCount">0 ticks</span>
             </div>
             <canvas id="secondCanvas" width="1100" height="180"></canvas>
+            <div class="second-macd-head">
+              <span>秒级MACD</span>
+              <strong id="secondsMacdSignal">等待数据</strong>
+            </div>
+            <canvas id="secondsMacdCanvas" width="1100" height="180"></canvas>
           </div>
         </section>
 
@@ -194,6 +199,8 @@
               <div><dt>游资点火</dt><dd id="hotMoneyIgnition">--</dd></div>
               <div><dt>主图MACD</dt><dd id="mainChartMacd">--</dd></div>
               <div><dt>秒级MACD</dt><dd id="secondsMacd">--</dd></div>
+              <div><dt>威科夫阶段</dt><dd id="wyckoffPhase">--</dd></div>
+              <div><dt>威科夫信号</dt><dd id="wyckoffSignal">--</dd></div>
               <div><dt>DDE资金流</dt><dd id="ddeFlow">--</dd></div>
               <div><dt>诱多风险</dt><dd id="bullTrap">--</dd></div>
               <div><dt>封板概率</dt><dd id="limitUpProbability">--</dd></div>
@@ -214,8 +221,18 @@
             <div class="third-party-ai">
               <div class="panel-title compact-title">
                 <h3>第三方API判断</h3>
-                <span id="thirdPartyEngine">--</span>
+                <div class="ai-segment" title="关闭后不请求 OpenAI/Gemini">
+                  <label>
+                    <input name="thirdPartyMode" type="radio" value="on" checked>
+                    <span>on</span>
+                  </label>
+                  <label>
+                    <input name="thirdPartyMode" type="radio" value="off">
+                    <span>off</span>
+                  </label>
+                </div>
               </div>
+              <div class="third-party-engine-line"><span id="thirdPartyEngine">--</span></div>
               <div id="thirdPartyNotice" class="openai-notice" hidden></div>
               <div id="thirdPartyDirection" class="direction neutral">--</div>
               <dl class="metrics third-party-metrics">

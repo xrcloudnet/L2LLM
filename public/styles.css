@@ -194,6 +194,48 @@ button {
   border-color: var(--line);
 }
 
+.ai-segment {
+  display: inline-flex;
+  align-items: center;
+  height: 30px;
+  padding: 2px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--panel-2);
+  font-size: 12px;
+  user-select: none;
+}
+
+.ai-segment label {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  cursor: pointer;
+}
+
+.ai-segment input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.ai-segment span {
+  display: inline-flex;
+  align-items: center;
+  height: 24px;
+  padding: 0 10px;
+  border-radius: 999px;
+  color: var(--muted);
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+.ai-segment input:checked + span {
+  background: var(--white);
+  color: #d61246;
+  font-weight: 800;
+}
+
 .portfolio-summary {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
@@ -373,6 +415,45 @@ canvas {
   height: 180px;
 }
 
+.second-macd-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 10px 0 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.second-macd-head strong {
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  padding: 4px 9px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.second-macd-head strong.buy,
+.second-macd-head strong.strong-buy {
+  color: var(--red);
+  border-color: rgba(239, 95, 95, 0.45);
+}
+
+.second-macd-head strong.sell {
+  color: var(--green);
+  border-color: rgba(40, 196, 122, 0.45);
+}
+
+.second-macd-head strong.wait {
+  color: var(--amber);
+  border-color: rgba(227, 179, 65, 0.45);
+}
+
+#secondsMacdCanvas {
+  height: 180px;
+}
+
 .side-panel {
   display: grid;
   gap: 14px;
@@ -486,6 +567,20 @@ canvas {
   margin-top: 16px;
   padding-top: 14px;
   border-top: 1px solid var(--line);
+}
+
+.third-party-engine-line {
+  display: flex;
+  justify-content: flex-end;
+  margin: -4px 0 8px;
+}
+
+.third-party-engine-line span {
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  padding: 4px 9px;
+  color: var(--muted);
+  font-size: 12px;
 }
 
 .compact-title {

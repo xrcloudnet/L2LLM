@@ -1,0 +1,9 @@
+# Local runtime databases and cache files.
+data/*.db
+data/*.db-*
+data/*.duckdb
+data/*.duckdb.*
+
+# Python/runtime caches.
+__pycache__/
+*.py[cod]

@@ -1,13 +1,11 @@
 import asyncio
 import json
-import math
 import os
 import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import akshare as ak
 import httpx
@@ -17,15 +15,32 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from backend.cache_store import redis_get, redis_set, redis_status
+from backend.analysis import run_local_analysis
 from backend.db import init_db, list_ai_analysis, list_market_candles, save_ai_analysis, save_market_candles, storage_status
+from backend.ifind_stream import get_ifind_push_quote, get_ifind_push_ticks, ifind_push_enabled, pushed_quote_to_ifind_shape
+from backend.providers.common import (
+    CHINA_TZ,
+    US_TZ,
+    china_market_day_ms,
+    china_market_time_ms,
+    df_records,
+    finite,
+    is_aggregated_interval,
+    normalize_a_share_symbol,
+    normalize_interval,
+    normalize_market_response_symbol,
+    numeric_series,
+    range_window_ms,
+    resample_candles,
+    synthesize_order_book,
+)
+from backend.providers.local_cache import fallback_to_local_market
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PUBLIC_DIR = ROOT / "public"
 PORTFOLIO_FILE = ROOT / "data" / "portfolio.json"
 PORT = int(os.getenv("PORT", "5177"))
-CHINA_TZ = ZoneInfo("Asia/Shanghai")
-US_TZ = ZoneInfo("America/New_York")
 PORTFOLIO_MARKETS = {
     "cn": {"label": "中国", "currency": "CNY"},
     "us": {"label": "美国", "currency": "USD"},
@@ -34,6 +49,7 @@ PORTFOLIO_MARKETS = {
 
 app = FastAPI(title="L2LLM Stock AI", version="0.2.0")
 cache: dict[str, tuple[float, Any]] = {}
+third_party_ai_pending: set[str] = set()
 
 
 @app.on_event("startup")
@@ -63,75 +79,6 @@ def cache_set(key: str, value: Any, ttl: float = 30) -> Any:
     redis_set(key, value, ttl)
     return value
 
-
-def finite(value: Any) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if math.isnan(number) or math.isinf(number):
-        return None
-    return number
-
-
-def china_market_time_ms(value: Any) -> int | None:
-    parsed = pd.to_datetime(value, errors="coerce")
-    if pd.isna(parsed):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.tz_localize(CHINA_TZ)
-    else:
-        parsed = parsed.tz_convert(CHINA_TZ)
-    return int(parsed.timestamp() * 1000)
-
-
-def china_market_day_ms(value: Any) -> int | None:
-    parsed = pd.to_datetime(value, errors="coerce")
-    if pd.isna(parsed):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.tz_localize(CHINA_TZ)
-    else:
-        parsed = parsed.tz_convert(CHINA_TZ)
-    day_start = parsed.normalize()
-    return int(day_start.timestamp() * 1000)
-
-
-def normalize_a_share_symbol(symbol: str) -> dict[str, str] | None:
-    raw = symbol.strip().upper().replace(" ", "")
-    prefixed = re.match(r"^(SH|SZ)(\d{6})$", raw)
-    suffixed = re.match(r"^(\d{6})\.(SH|SZ|SS)$", raw)
-    plain = re.match(r"^(\d{6})$", raw)
-
-    code = None
-    exchange = None
-    if prefixed:
-        exchange = prefixed.group(1).lower()
-        code = prefixed.group(2)
-    elif suffixed:
-        code = suffixed.group(1)
-        exchange = "sh" if suffixed.group(2) in {"SH", "SS"} else "sz"
-    elif plain:
-        code = plain.group(1)
-        exchange = "sh" if code.startswith(("6", "9")) else "sz"
-
-    if not code or not exchange:
-        return None
-
-    return {
-        "code": code,
-        "exchange": exchange,
-        "display": f"{exchange.upper()}{code}",
-        "secid": f"{1 if exchange == 'sh' else 0}.{code}",
-        "sina": f"{exchange}{code}",
-    }
-
-
-def normalize_market_response_symbol(symbol: str) -> str:
-    a_share = normalize_a_share_symbol(symbol)
-    if a_share:
-        return a_share["display"]
-    return symbol.strip().upper()
 
 
 def load_portfolio() -> dict[str, Any]:
@@ -376,125 +323,60 @@ async def build_portfolio_snapshot(market_filter: str = "all") -> dict[str, Any]
     }
 
 
-def range_window_ms(range_name: str) -> int:
-    if range_name == "all":
-        return 100 * 365 * 24 * 60 * 60 * 1000
-    if range_name == "ytd":
-        start = datetime(datetime.now().year, 1, 1)
-        return max(1, int((datetime.now() - start).total_seconds() * 1000))
-    days = {
-        "1d": 1,
-        "5d": 7,
-        "1mo": 35,
-        "3mo": 100,
-        "6mo": 190,
-        "1y": 380,
-        "3y": 365 * 3 + 15,
-        "5y": 365 * 5 + 20,
-        "10y": 365 * 10 + 40,
-    }.get(range_name, 1)
-    return days * 24 * 60 * 60 * 1000
-
-
-def normalize_interval(interval: str) -> str:
-    return {
-        "1m": "1",
-        "2m": "1",
-        "5m": "5",
-        "15m": "15",
-        "30m": "30",
-        "60m": "60",
-        "1d": "101",
-        "1wk": "102",
-        "1w": "102",
-        "1week": "102",
-        "1mo": "103",
-        "3mo": "103",
-        "6mo": "103",
-    }.get(interval, "1")
-
-
-def is_aggregated_interval(interval: str) -> bool:
-    return interval in {"1wk", "1w", "1week", "1mo", "3mo", "6mo"}
-
-
-def resample_candles(candles: list[dict[str, Any]], interval: str) -> list[dict[str, Any]]:
-    if not is_aggregated_interval(interval) or not candles:
-        return candles
-
-    df = pd.DataFrame(candles)
-    if df.empty:
-        return candles
-
-    df["datetime"] = pd.to_datetime(df["time"], unit="ms", errors="coerce", utc=True).dt.tz_convert(CHINA_TZ)
-    df = df.dropna(subset=["datetime"]).sort_values("datetime").set_index("datetime")
-    df["time_ms"] = [int(timestamp.timestamp() * 1000) for timestamp in df.index]
-    rule = {
-        "1wk": "W-FRI",
-        "1w": "W-FRI",
-        "1week": "W-FRI",
-        "1mo": "ME",
-        "3mo": "QE",
-        "6mo": "2QE",
-    }[interval]
-
-    agg = {
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum",
-        "amount": "sum",
-        "time_ms": "last",
-    }
-    resampled = df.resample(rule).agg(agg).dropna(subset=["open", "high", "low", "close"])
-    records = []
-    for timestamp, row in resampled.iterrows():
-        records.append(
-            {
-                "time": int(row.get("time_ms")),
-                "open": finite(row.get("open")),
-                "high": finite(row.get("high")),
-                "low": finite(row.get("low")),
-                "close": finite(row.get("close")),
-                "volume": finite(row.get("volume")),
-                "amount": finite(row.get("amount")),
-            }
-        )
-    return records
-
 
 async def http_json(url: str, *, ttl: float, key: str, headers: dict[str, str] | None = None) -> Any:
     cached = cache_get(key, ttl)
     if cached is not None:
         return cached
-    async with httpx.AsyncClient(timeout=12.0, headers=headers) as client:
-        response = await client.get(url)
+    try:
+        async with httpx.AsyncClient(timeout=12.0, headers=headers) as client:
+            response = await client.get(url)
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(f"Timeout connecting to data source: {url}") from exc
+    except httpx.TransportError as exc:
+        raise RuntimeError(f"Network error connecting to data source: {url}: {exc}") from exc
+    try:
         if response.status_code >= 400:
             body = response.text[:300].replace("\n", " ").strip()
             raise RuntimeError(f"HTTP {response.status_code} from data source: {url}. {body}")
         return cache_set(key, response.json(), ttl)
+    finally:
+        await response.aclose()
 
 
 async def http_text(url: str, *, ttl: float, key: str, headers: dict[str, str] | None = None, encoding: str = "utf-8") -> str:
     cached = cache_get(key, ttl)
     if cached is not None:
         return cached
-    async with httpx.AsyncClient(timeout=12.0, headers=headers) as client:
-        response = await client.get(url)
+    try:
+        async with httpx.AsyncClient(timeout=12.0, headers=headers) as client:
+            response = await client.get(url)
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(f"Timeout connecting to data source: {url}") from exc
+    except httpx.TransportError as exc:
+        raise RuntimeError(f"Network error connecting to data source: {url}: {exc}") from exc
+    try:
         if response.status_code >= 400:
             body = response.text[:300].replace("\n", " ").strip()
             raise RuntimeError(f"HTTP {response.status_code} from data source: {url}. {body}")
         text = response.content.decode(encoding, errors="replace")
         return cache_set(key, text, ttl)
+    finally:
+        await response.aclose()
 
 
 async def http_json_params(url: str, *, params: dict[str, Any], ttl: float, key: str) -> Any:
     cached = cache_get(key, ttl)
     if cached is not None:
         return cached
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        response = await client.get(url, params=params)
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.get(url, params=params)
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(f"Timeout connecting to data source: {url}") from exc
+    except httpx.TransportError as exc:
+        raise RuntimeError(f"Network error connecting to data source: {url}: {exc}") from exc
+    try:
         if response.status_code >= 400:
             body = response.text[:300].replace("\n", " ").strip()
             raise RuntimeError(f"HTTP {response.status_code} from data source: {response.url}. {body}")
@@ -502,6 +384,8 @@ async def http_json_params(url: str, *, params: dict[str, Any], ttl: float, key:
         if isinstance(data, dict) and data.get("status") == "error":
             raise RuntimeError(f"Twelve Data error: {data.get('message') or data.get('code') or data}")
         return cache_set(key, data, ttl)
+    finally:
+        await response.aclose()
 
 
 def ifind_enabled() -> bool:
@@ -525,11 +409,17 @@ async def ifind_access_token() -> str:
     if not refresh_token:
         raise RuntimeError("IFIND_ACCESS_TOKEN or IFIND_REFRESH_TOKEN is required.")
 
-    async with httpx.AsyncClient(timeout=12.0) as client:
-        response = await client.post(
-            "https://quantapi.51ifind.com/api/v1/get_access_token",
-            headers={"Content-Type": "application/json", "refresh_token": refresh_token},
-        )
+    token_url = "https://quantapi.51ifind.com/api/v1/get_access_token"
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.post(
+                token_url,
+                headers={"Content-Type": "application/json", "refresh_token": refresh_token},
+            )
+    except httpx.TimeoutException as exc:
+        raise RuntimeError("Timeout connecting to iFinD token API") from exc
+    except httpx.TransportError as exc:
+        raise RuntimeError(f"Network error connecting to iFinD token API: {exc}") from exc
     if response.status_code >= 400:
         body = response.text[:300].replace("\n", " ").strip()
         raise RuntimeError(f"iFinD token HTTP {response.status_code}: {body}")
@@ -555,12 +445,17 @@ async def ifind_post(path: str, payload: dict[str, Any], *, ttl: float, key: str
 
     token = await ifind_access_token()
     url = f"https://quantapi.51ifind.com/api/v1/{path}"
-    async with httpx.AsyncClient(timeout=16.0) as client:
-        response = await client.post(
-            url,
-            json=payload,
-            headers={"Content-Type": "application/json", "access_token": token, "Accept-Encoding": "gzip,deflate"},
-        )
+    try:
+        async with httpx.AsyncClient(timeout=16.0) as client:
+            response = await client.post(
+                url,
+                json=payload,
+                headers={"Content-Type": "application/json", "access_token": token, "Accept-Encoding": "gzip,deflate"},
+            )
+    except httpx.TimeoutException as exc:
+        raise RuntimeError(f"Timeout connecting to iFinD API: {path}") from exc
+    except httpx.TransportError as exc:
+        raise RuntimeError(f"Network error connecting to iFinD API {path}: {exc}") from exc
     if response.status_code >= 400:
         body = response.text[:300].replace("\n", " ").strip()
         raise RuntimeError(f"iFinD HTTP {response.status_code}: {body}")
@@ -662,17 +557,6 @@ async def run_blocking(func, *args, **kwargs):
 async def run_blocking_timeout(timeout: float, func, *args, **kwargs):
     return await asyncio.wait_for(run_blocking(func, *args, **kwargs), timeout=timeout)
 
-
-def df_records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    return json.loads(df.where(pd.notnull(df), None).to_json(orient="records", force_ascii=False))
-
-
-def numeric_series(df: pd.DataFrame, column: str, default: float = 0) -> pd.Series:
-    if column in df:
-        source = df[column]
-    else:
-        source = pd.Series([default] * len(df), index=df.index)
-    return pd.to_numeric(source, errors="coerce").fillna(default)
 
 
 async def ak_bid_ask(symbol: str) -> dict[str, Any]:
@@ -908,10 +792,15 @@ async def fetch_ifind_a_share_market(symbol_info: dict[str, str], range_name: st
     if not ifind_enabled():
         raise RuntimeError("USE_IFIND is not 1.")
 
-    quote_data, candles = await asyncio.gather(
-        ifind_realtime_quote(symbol_info),
-        ifind_candles(symbol_info, range_name, interval),
-    )
+    pushed_quote = get_ifind_push_quote(symbol_info["display"])
+    if pushed_quote:
+        quote_data = pushed_quote_to_ifind_shape(pushed_quote)
+        candles = await ifind_candles(symbol_info, range_name, interval)
+    else:
+        quote_data, candles = await asyncio.gather(
+            ifind_realtime_quote(symbol_info),
+            ifind_candles(symbol_info, range_name, interval),
+        )
     if not candles:
         raise RuntimeError("iFinD returned empty K-line data.")
     quote = quote_data["quote"]
@@ -946,7 +835,7 @@ async def fetch_ifind_a_share_market(symbol_info: dict[str, str], range_name: st
         "currency": "CNY",
         "marketType": "cn",
         "marketState": "A股",
-        "provider": "iFinD HTTP API + Pandas",
+        "provider": "iFinD Push + Pandas" if pushed_quote else "iFinD HTTP API + Pandas",
         "delayed": False,
         "updatedAt": now_iso(),
         "quote": quote,
@@ -967,151 +856,6 @@ async def fetch_china_market(symbol_info: dict[str, str], range_name: str, inter
             payload["orderBook"]["note"] = f"{payload['orderBook'].get('note', '')} iFinD failed, fallback to AKShare/Eastmoney/Sina.".strip()
         return payload
 
-
-async def local_cached_market_payload(
-    *,
-    market: str,
-    symbol: str,
-    range_name: str,
-    interval: str,
-    reason: str,
-) -> dict[str, Any] | None:
-    rows = await asyncio.to_thread(
-        list_market_candles,
-        market=market,
-        symbol=symbol,
-        interval=interval,
-        limit=5000,
-    )
-    if not rows and is_aggregated_interval(interval):
-        daily_rows = await asyncio.to_thread(
-            list_market_candles,
-            market=market,
-            symbol=symbol,
-            interval="1d",
-            limit=5000,
-        )
-        daily_candles = [
-            {
-                "time": row.get("time"),
-                "open": row.get("open"),
-                "high": row.get("high"),
-                "low": row.get("low"),
-                "close": row.get("close"),
-                "volume": row.get("volume"),
-                "amount": None,
-            }
-            for row in daily_rows
-        ]
-        rows = [
-            {
-                "time": candle.get("time"),
-                "open": candle.get("open"),
-                "high": candle.get("high"),
-                "low": candle.get("low"),
-                "close": candle.get("close"),
-                "volume": candle.get("volume"),
-                "provider": "local daily resample",
-            }
-            for candle in resample_candles(daily_candles, interval)
-        ]
-    if not rows:
-        return None
-
-    cutoff = int(time.time() * 1000) - range_window_ms(range_name)
-    candles = [
-        {
-            "time": row.get("time"),
-            "open": row.get("open"),
-            "high": row.get("high"),
-            "low": row.get("low"),
-            "close": row.get("close"),
-            "volume": row.get("volume"),
-            "cached": True,
-        }
-        for row in rows
-        if range_name == "all" or int(row.get("time") or 0) >= cutoff
-    ]
-    if not candles:
-        candles = [
-            {
-                "time": row.get("time"),
-                "open": row.get("open"),
-                "high": row.get("high"),
-                "low": row.get("low"),
-                "close": row.get("close"),
-                "volume": row.get("volume"),
-                "cached": True,
-            }
-            for row in rows[-min(len(rows), 500):]
-        ]
-    candles = [candle for candle in candles if all(candle.get(key) is not None for key in ["time", "open", "high", "low", "close"])]
-    if not candles:
-        return None
-
-    last = candles[-1]
-    previous = candles[-2]["close"] if len(candles) > 1 else last["open"]
-    price = finite(last.get("close"))
-    previous_close = finite(previous)
-    change = price - previous_close if price is not None and previous_close is not None else None
-    currency = {"cn": "CNY", "us": "USD", "hk": "HKD"}.get(market, "")
-    exchange = {
-        "cn": "China A-share cached history",
-        "us": "US cached history",
-        "hk": "Hong Kong cached history",
-    }.get(market, "cached history")
-
-    quote = {
-        "price": price,
-        "previousClose": previous_close,
-        "open": finite(last.get("open")),
-        "dayHigh": finite(last.get("high")),
-        "dayLow": finite(last.get("low")),
-        "volume": finite(last.get("volume")),
-        "amount": None,
-        "change": change,
-        "changePercent": change / previous_close * 100 if change is not None and previous_close else None,
-    }
-    return {
-        "symbol": symbol,
-        "name": symbol,
-        "exchange": exchange,
-        "currency": currency,
-        "marketType": market,
-        "marketState": "LOCAL_CACHE",
-        "provider": f"Local SQLite cache (external fallback: {reason})",
-        "delayed": True,
-        "cached": True,
-        "updatedAt": now_iso(),
-        "quote": quote,
-        "candles": candles,
-        "orderBook": {
-            **synthesize_order_book(price, candles),
-            "note": "外部数据源不可用，当前读取本地 SQLite 历史K线；盘口为估算值。",
-        },
-        "fundFlow": None,
-        "quoteTime": datetime.fromtimestamp(int(last["time"]) / 1000, timezone.utc).isoformat(),
-    }
-
-
-async def fallback_to_local_market(
-    *,
-    market: str,
-    symbol: str,
-    range_name: str,
-    interval: str,
-    reason: str,
-) -> dict[str, Any]:
-    cached = await local_cached_market_payload(
-        market=market,
-        symbol=symbol,
-        range_name=range_name,
-        interval=interval,
-        reason=reason,
-    )
-    if cached:
-        return cached
-    raise HTTPException(status_code=502, detail=f"{reason}; local SQLite cache is empty for {symbol} {interval}.")
 
 
 async def ak_minute_candles(symbol_info: dict[str, str], range_name: str, interval: str) -> list[dict[str, Any]]:
@@ -1878,938 +1622,84 @@ async def fetch_twelve_data_market(symbol: str, range_name: str, interval: str) 
     }
 
 
-def synthesize_order_book(price: float | None, candles: list[dict[str, Any]]) -> dict[str, Any]:
-    if not price:
-        return {"provider": "synthetic-depth", "bids": [], "asks": [], "imbalance": 0}
-    df = pd.DataFrame(candles[-30:])
-    avg_range = float((df["high"] - df["low"]).clip(lower=0).mean()) if not df.empty else price * 0.001
-    tick = max(price * 0.0003, avg_range * 0.08, 0.01)
-    momentum = 0.0
-    if len(candles) > 5:
-        momentum = (candles[-1]["close"] - candles[-5]["close"]) / candles[-5]["close"]
-    bias = max(-0.35, min(0.35, momentum * 12))
-    bids = [{"price": price - tick * i, "size": round((1200 + i * 170) * (1 + bias))} for i in range(1, 9)]
-    asks = [{"price": price + tick * i, "size": round((1200 + i * 170) * (1 - bias))} for i in range(1, 9)]
-    bid_total = sum(row["size"] for row in bids)
-    ask_total = sum(row["size"] for row in asks)
-    return {
-        "provider": "synthetic-depth",
-        "note": "美股免费源不含实时Level2盘口，此处为演示盘口；A股会优先使用 AKShare 五档盘口。",
-        "bids": bids,
-        "asks": asks,
-        "imbalance": (bid_total - ask_total) / max(bid_total + ask_total, 1),
-    }
 
-
-def compute_indicators(candles: list[dict[str, Any]]) -> dict[str, Any]:
-    df = pd.DataFrame(candles)
-    if df.empty:
-        return {"ma20": None, "ma60": None, "rsi14": None, "volumeRatio": 1, "support": None, "resistance": None}
-    close = pd.to_numeric(df["close"], errors="coerce")
-    volume = numeric_series(df, "volume")
-    delta = close.diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
-    rs = gain / loss.replace(0, pd.NA)
-    rsi = 100 - (100 / (1 + rs))
-    recent_volume = volume.tail(5).mean()
-    base_volume = volume.iloc[-40:-5].mean() if len(volume) > 40 else volume.mean()
-    recent = df.tail(20)
-    return {
-        "ma20": finite(close.tail(20).mean()) if len(close) >= 20 else None,
-        "ma60": finite(close.tail(60).mean()) if len(close) >= 60 else None,
-        "rsi14": finite(rsi.iloc[-1]) if not rsi.empty else None,
-        "volumeRatio": finite(recent_volume / base_volume) if base_volume else 1,
-        "support": finite(pd.to_numeric(recent["low"], errors="coerce").min()) if not recent.empty else None,
-        "resistance": finite(pd.to_numeric(recent["high"], errors="coerce").max()) if not recent.empty else None,
-    }
-
-
-def clamp(value: float, low: float = 0, high: float = 100) -> float:
-    return max(low, min(high, value))
-
-
-def label_by_score(score: float, high: str = "高", mid: str = "中", low: str = "低") -> str:
-    if score >= 70:
-        return high
-    if score >= 45:
-        return mid
-    return low
-
-
-def estimate_dde_flow(
-    quote: dict[str, Any],
-    candles: list[dict[str, Any]],
-    order_book: dict[str, Any],
-) -> dict[str, Any]:
-    df = pd.DataFrame(candles)
-    amount = numeric_series(df, "amount") if not df.empty else pd.Series(dtype="float64")
-    volume = numeric_series(df, "volume") if not df.empty else pd.Series(dtype="float64")
-    last_amount = finite(quote.get("amount")) or (finite(amount.iloc[-1]) if not amount.empty else 0) or 0
-    avg_amount = finite(amount.tail(20).mean()) if not amount.empty else 0
-    turnover = last_amount or avg_amount or 0
-    change_pct = finite(quote.get("changePercent")) or 0
-    order_imbalance = finite(order_book.get("imbalance")) or 0
-    volume_ratio = 1
-    if len(volume) >= 20:
-        recent_volume = finite(volume.tail(5).mean()) or 0
-        base_volume = finite(volume.iloc[-20:-5].mean()) or 0
-        volume_ratio = recent_volume / base_volume if base_volume else 1
-
-    flow_ratio = clamp(order_imbalance * 18 + change_pct * 0.9 + (volume_ratio - 1) * 6, -25, 25)
-    main_net = turnover * flow_ratio / 100 if turnover else 0
-    return {
-        "source": "order-book and turnover estimate",
-        "quality": "estimated",
-        "estimated": True,
-        "date": now_iso(),
-        "mainNetInflow": main_net,
-        "mainNetInflowRatio": flow_ratio,
-        "superLargeNetInflow": main_net * 0.45,
-        "superLargeNetInflowRatio": flow_ratio * 0.45,
-        "largeNetInflow": main_net * 0.35,
-        "largeNetInflowRatio": flow_ratio * 0.35,
-        "mediumNetInflow": -main_net * 0.2,
-        "mediumNetInflowRatio": -flow_ratio * 0.2,
-        "smallNetInflow": -main_net * 0.6,
-        "smallNetInflowRatio": -flow_ratio * 0.6,
-        "ddx": flow_ratio,
-        "ddy": flow_ratio * max(0.6, min(1.8, volume_ratio)),
-        "ddz": flow_ratio + order_imbalance * 30,
-        "recentMainNetInflow": main_net,
-        "recentMainNetInflowRatioAvg": flow_ratio,
-    }
-
-
-def build_dde_signal(fund_flow: dict[str, Any] | None) -> dict[str, Any]:
-    flow = fund_flow or {}
-    ddx = finite(flow.get("ddx")) or 0
-    ddy = finite(flow.get("ddy")) or 0
-    ddz = finite(flow.get("ddz")) or 0
-    main_ratio = finite(flow.get("mainNetInflowRatio")) or ddx
-    main_net = finite(flow.get("mainNetInflow")) or 0
-    super_ratio = finite(flow.get("superLargeNetInflowRatio")) or 0
-    large_ratio = finite(flow.get("largeNetInflowRatio")) or 0
-
-    score = 50 + main_ratio * 2.2 + ddy * 1.2 + ddz * 0.8
-    if super_ratio + large_ratio > 0:
-        score += min(12, (super_ratio + large_ratio) * 0.8)
-    else:
-        score += max(-12, (super_ratio + large_ratio) * 0.8)
-    score = clamp(score)
-
-    if main_ratio >= 5 and ddz >= 5:
-        label = "强流入"
-    elif main_ratio >= 1.5:
-        label = "流入"
-    elif main_ratio <= -5 and ddz <= -5:
-        label = "强流出"
-    elif main_ratio <= -1.5:
-        label = "流出"
-    else:
-        label = "均衡"
-
-    reasons = [
-        f"主力净流入占比 {main_ratio:.2f}%",
-        f"DDX {ddx:.2f}，DDY {ddy:.2f}，DDZ {ddz:.2f}",
-    ]
-    if main_net:
-        reasons.append(f"主力净额约 {main_net / 10000:.1f} 万")
-    if flow.get("estimated"):
-        reasons.append("缺少逐笔大单数据，当前为盘口/成交额估算")
-    elif flow.get("source"):
-        reasons.append(f"资金流来源：{flow.get('source')}")
-
-    return {
-        "score": round(score),
-        "label": label,
-        "reasons": reasons[:5],
-        "metrics": {
-            "ddx": ddx,
-            "ddy": ddy,
-            "ddz": ddz,
-            "mainNetInflow": main_net,
-            "mainNetInflowRatio": main_ratio,
-            "superLargeNetInflowRatio": super_ratio,
-            "largeNetInflowRatio": large_ratio,
-            "estimated": bool(flow.get("estimated")),
-            "source": flow.get("source") or "",
-        },
-    }
-
-
-def build_realtime_bars(ticks: list[dict[str, Any]], interval_ms: int = 3000) -> list[dict[str, Any]]:
-    rows = []
-    for tick in ticks or []:
-        timestamp = finite(tick.get("time"))
-        price = finite(tick.get("price"))
-        if timestamp is None or price is None:
-            continue
-        rows.append(
-            {
-                "time": int(timestamp),
-                "price": price,
-                "volume": finite(tick.get("volume")),
-                "amount": finite(tick.get("amount")),
-            }
-        )
-    rows = sorted(rows, key=lambda item: item["time"])
-    if not rows:
-        return []
-
-    normalized = []
-    previous_volume = None
-    previous_amount = None
-    for row in rows:
-        volume = row.get("volume")
-        amount = row.get("amount")
-        delta_volume = 0
-        delta_amount = 0
-        if volume is not None and previous_volume is not None:
-            delta_volume = max(0, volume - previous_volume)
-        if amount is not None and previous_amount is not None:
-            delta_amount = max(0, amount - previous_amount)
-        normalized.append({**row, "deltaVolume": delta_volume, "deltaAmount": delta_amount})
-        if volume is not None:
-            previous_volume = volume
-        if amount is not None:
-            previous_amount = amount
-
-    bars = []
-    for row in normalized:
-        bucket = row["time"] - row["time"] % interval_ms
-        if not bars or bars[-1]["time"] != bucket:
-            bars.append(
-                {
-                    "time": bucket,
-                    "open": row["price"],
-                    "high": row["price"],
-                    "low": row["price"],
-                    "close": row["price"],
-                    "volume": row["deltaVolume"],
-                    "amount": row["deltaAmount"],
-                }
-            )
-            continue
-        bar = bars[-1]
-        bar["high"] = max(bar["high"], row["price"])
-        bar["low"] = min(bar["low"], row["price"])
-        bar["close"] = row["price"]
-        bar["volume"] += row["deltaVolume"]
-        bar["amount"] += row["deltaAmount"]
-
-    for bar in bars:
-        if not bar["volume"]:
-            bar["volume"] = 1
-        if not bar["amount"]:
-            bar["amount"] = bar["close"] * bar["volume"]
-    return bars
-
-
-def build_seconds_macd_signal(realtime_ticks: list[dict[str, Any]], quote: dict[str, Any]) -> dict[str, Any]:
-    bars = build_realtime_bars(realtime_ticks)
-    df = pd.DataFrame(bars)
-    if len(df) < 35:
-        return {
-            "score": 0,
-            "label": "不足",
-            "action": "WAIT",
-            "reasons": ["当日秒级/分时数据不足，无法计算秒级MACD"],
-            "metrics": {"barCount": len(df), "source": "realtimeTicks"},
-        }
-
-    close = pd.to_numeric(df["close"], errors="coerce")
-    high = pd.to_numeric(df["high"], errors="coerce")
-    volume = numeric_series(df, "volume")
-    amount = numeric_series(df, "amount")
-    times = pd.to_numeric(df.get("time", pd.Series(dtype="float64")), errors="coerce")
-
-    fast = close.ewm(span=12, adjust=False).mean()
-    slow = close.ewm(span=26, adjust=False).mean()
-    dif = fast - slow
-    dea = dif.ewm(span=9, adjust=False).mean()
-    hist = (dif - dea) * 2
-
-    # 秒级MACD必须以独立实时 tick 为准，主图 quote 只在 tick 缺失时兜底。
-    last_price = finite(close.iloc[-1]) or finite(quote.get("price"))
-    last_time = finite(times.iloc[-1]) if not times.empty else None
-    if last_price is None:
-        return {
-            "score": 0,
-            "label": "不足",
-            "action": "WAIT",
-            "reasons": ["最新价不可用，无法生成MACD交易信号"],
-            "metrics": {"barCount": len(df), "source": "realtimeTicks"},
-        }
-
-    if last_time is not None:
-        recent_mask = times >= last_time - 180_000
-        recent_high_series = high[recent_mask].iloc[:-1]
-        volume_mask = times >= last_time - 60_000
-        volume_base = volume[volume_mask].iloc[:-1]
-    else:
-        recent_high_series = high.iloc[-61:-1]
-        volume_base = volume.iloc[-21:-1]
-
-    if recent_high_series.empty:
-        recent_high_series = high.iloc[-min(len(high), 61):-1]
-    recent_3min_high = finite(recent_high_series.max()) if not recent_high_series.empty else None
-
-    if volume_base.empty:
-        volume_base = volume.iloc[-21:-1]
-    last_volume = finite(volume.iloc[-1]) or 0
-    avg_volume = finite(volume_base.mean()) if not volume_base.empty else None
-    volume_multiplier = last_volume / avg_volume if avg_volume else 1
-
-    intraday_amount = finite(amount.sum()) or 0
-    intraday_volume = finite(volume.sum()) or 0
-    vwap = intraday_amount / intraday_volume if intraday_amount and intraday_volume else None
-    short_ema = finite(close.ewm(span=10, adjust=False).mean().iloc[-1])
-
-    dif_now = finite(dif.iloc[-1]) or 0
-    dea_now = finite(dea.iloc[-1]) or 0
-    hist_values = [finite(value) or 0 for value in hist.tail(4)]
-    hist_positive = hist_values[-1] > 0
-    hist_expanding_3 = len(hist_values) >= 3 and hist_values[-3] > 0 and hist_values[-2] > hist_values[-3] and hist_values[-1] > hist_values[-2]
-    hist_shrinking_3 = len(hist_values) >= 3 and hist_values[-3] > 0 and hist_values[-2] < hist_values[-3] and hist_values[-1] < hist_values[-2]
-    cross_up = len(dif) >= 2 and dif.iloc[-2] <= dea.iloc[-2] and dif.iloc[-1] > dea.iloc[-1]
-    cross_down = len(dif) >= 2 and dif.iloc[-2] >= dea.iloc[-2] and dif.iloc[-1] < dea.iloc[-1]
-    price_break_3min_high = recent_3min_high is not None and last_price > recent_3min_high
-    volume_expand = volume_multiplier >= 1.5
-    above_vwap = vwap is None or last_price >= vwap
-    below_vwap = vwap is not None and last_price < vwap
-    below_short_ema = short_ema is not None and last_price < short_ema
-
-    strong_buy = dif_now > 0 and dea_now > 0 and hist_expanding_3 and price_break_3min_high and volume_expand
-    buy = not strong_buy and (cross_up or (dif_now > dea_now and hist_positive)) and above_vwap and volume_multiplier >= 1.15
-    sell = cross_down or hist_shrinking_3 or (below_vwap and below_short_ema)
-
-    score = 45
-    reasons = []
-    risks = []
-    if dif_now > 0 and dea_now > 0:
-        score += 12
-        reasons.append("DIF与DEA均在零轴上方")
-    if hist_expanding_3:
-        score += 20
-        reasons.append("MACD红柱连续放大3根")
-    if price_break_3min_high:
-        score += 18
-        reasons.append("股价突破最近3分钟高点")
-    if volume_expand:
-        score += 14
-        reasons.append(f"成交量同步放大 {volume_multiplier:.2f}x")
-    if above_vwap and vwap is not None:
-        score += 6
-        reasons.append("价格位于VWAP上方")
-    if sell:
-        score -= 28
-        risks.append("MACD动能转弱或价格跌破短线均衡位")
-    if below_vwap:
-        risks.append("价格跌破VWAP，追击胜率下降")
-
-    if strong_buy:
-        label = "强买"
-        action = "STRONG_BUY"
-    elif buy:
-        label = "买入"
-        action = "BUY"
-    elif sell:
-        label = "卖出/止盈"
-        action = "SELL"
-    else:
-        label = "观望"
-        action = "WAIT"
-
-    if not reasons:
-        reasons.append("秒级MACD条件未形成共振")
-    if action in {"STRONG_BUY", "BUY"} and not risks:
-        risks.append("追击型信号需严格止损，红柱缩短或跌回突破位应撤退")
-
-    return {
-        "score": round(clamp(score)),
-        "label": label,
-        "action": action,
-        "reasons": reasons[:5],
-        "risks": risks[:4],
-        "metrics": {
-            "dif": dif_now,
-            "dea": dea_now,
-            "hist": hist_values[-1],
-            "recent3MinHigh": recent_3min_high,
-            "priceBreak3MinHigh": price_break_3min_high,
-            "volumeMultiplier": volume_multiplier,
-            "histExpanding3": hist_expanding_3,
-            "histShrinking3": hist_shrinking_3,
-            "vwap": vwap,
-            "shortEma10": short_ema,
-            "barCount": len(df),
-            "barIntervalSeconds": 3,
-            "source": "realtimeTicks",
-        },
-    }
-
-
-def build_main_chart_macd_signal(
-    candles: list[dict[str, Any]],
-    range_name: str | None = None,
-    interval: str | None = None,
-) -> dict[str, Any]:
-    """Calculate MACD from the currently displayed main-chart candles."""
-    df = pd.DataFrame(candles)
-    if len(df) < 35 or "close" not in df:
-        return {
-            "score": 0,
-            "label": "不足",
-            "action": "WAIT",
-            "reasons": ["主图K线数据不足，无法计算主图MACD"],
-            "metrics": {"barCount": len(df), "source": "mainCandles", "range": range_name, "interval": interval},
-        }
-
-    close = pd.to_numeric(df["close"], errors="coerce").dropna()
-    if len(close) < 35:
-        return {
-            "score": 0,
-            "label": "不足",
-            "action": "WAIT",
-            "reasons": ["主图K线收盘价不足，无法计算主图MACD"],
-            "metrics": {"barCount": len(close), "source": "mainCandles", "range": range_name, "interval": interval},
-        }
-
-    fast = close.ewm(span=12, adjust=False).mean()
-    slow = close.ewm(span=26, adjust=False).mean()
-    dif = fast - slow
-    dea = dif.ewm(span=9, adjust=False).mean()
-    hist = (dif - dea) * 2
-
-    dif_now = finite(dif.iloc[-1]) or 0
-    dea_now = finite(dea.iloc[-1]) or 0
-    hist_now = finite(hist.iloc[-1]) or 0
-    hist_prev = finite(hist.iloc[-2]) if len(hist) >= 2 else None
-    hist_tail = [finite(value) or 0 for value in hist.tail(4)]
-    cross_up = len(dif) >= 2 and dif.iloc[-2] <= dea.iloc[-2] and dif.iloc[-1] > dea.iloc[-1]
-    cross_down = len(dif) >= 2 and dif.iloc[-2] >= dea.iloc[-2] and dif.iloc[-1] < dea.iloc[-1]
-    hist_expanding_3 = len(hist_tail) >= 3 and hist_tail[-3] > 0 and hist_tail[-2] > hist_tail[-3] and hist_tail[-1] > hist_tail[-2]
-    hist_shrinking_3 = len(hist_tail) >= 3 and hist_tail[-3] > 0 and hist_tail[-2] < hist_tail[-3] and hist_tail[-1] < hist_tail[-2]
-    hist_turn_positive = hist_now > 0 and (hist_prev is None or hist_now >= hist_prev)
-    hist_turn_negative = hist_now < 0 and (hist_prev is None or hist_now <= hist_prev)
-
-    score = 50
-    reasons = []
-    risks = []
-    if dif_now > 0 and dea_now > 0:
-        score += 14
-        reasons.append("DIF与DEA位于零轴上方")
-    elif dif_now < 0 and dea_now < 0:
-        score -= 14
-        risks.append("DIF与DEA位于零轴下方")
-    if cross_up:
-        score += 16
-        reasons.append("主图MACD金叉")
-    if cross_down:
-        score -= 16
-        risks.append("主图MACD死叉")
-    if hist_expanding_3:
-        score += 14
-        reasons.append("主图MACD红柱连续放大")
-    elif hist_shrinking_3:
-        score -= 12
-        risks.append("主图MACD红柱连续缩短")
-    elif hist_turn_positive:
-        score += 8
-        reasons.append("主图MACD柱体偏多")
-    elif hist_turn_negative:
-        score -= 8
-        risks.append("主图MACD柱体偏空")
-
-    if score >= 68:
-        label = "偏多"
-        action = "BUY_BIAS"
-    elif score <= 36:
-        label = "偏空"
-        action = "SELL_BIAS"
-    else:
-        label = "震荡"
-        action = "WAIT"
-
-    if not reasons:
-        reasons.append("主图MACD尚未形成明确多头信号")
-    if label != "偏空" and not risks:
-        risks.append("主图MACD仍需结合量能与盘口确认")
-
-    return {
-        "score": round(clamp(score)),
-        "label": label,
-        "action": action,
-        "reasons": reasons[:5],
-        "risks": risks[:4],
-        "metrics": {
-            "dif": dif_now,
-            "dea": dea_now,
-            "hist": hist_now,
-            "histExpanding3": hist_expanding_3,
-            "histShrinking3": hist_shrinking_3,
-            "barCount": len(close),
-            "source": "mainCandles",
-            "range": range_name,
-            "interval": interval,
-        },
-    }
-
-
-def build_market_signals(
-    quote: dict[str, Any],
-    candles: list[dict[str, Any]],
-    order_book: dict[str, Any],
-    metrics: dict[str, Any],
-    fund_flow: dict[str, Any] | None = None,
-    realtime_ticks: list[dict[str, Any]] | None = None,
-    range_name: str | None = None,
-    interval: str | None = None,
-) -> dict[str, Any]:
-    df = pd.DataFrame(candles)
-    main_chart_macd = build_main_chart_macd_signal(candles, range_name, interval)
-    seconds_macd = build_seconds_macd_signal(realtime_ticks or [], quote)
-    if df.empty:
-        return {
-            "mainAccumulation": {"score": 0, "label": "不足", "reasons": ["K线数据不足"]},
-            "hotMoneyIgnition": {"score": 0, "label": "不足", "reasons": ["K线数据不足"]},
-            "mainChartMacd": main_chart_macd,
-            "secondsMacd": seconds_macd,
-            "ddeFlow": {"score": 0, "label": "不足", "reasons": ["K线数据不足"], "metrics": {}},
-            "bullTrap": {"score": 0, "label": "不足", "reasons": ["K线数据不足"]},
-            "limitUpProbability": {"score": 0, "label": "低", "reasons": ["K线数据不足"]},
-            "riskLevel": {"score": 60, "label": "中", "reasons": ["K线数据不足，风险默认偏中"]},
-        }
-
-    close = pd.to_numeric(df["close"], errors="coerce")
-    open_ = pd.to_numeric(df["open"], errors="coerce")
-    high = pd.to_numeric(df["high"], errors="coerce")
-    low = pd.to_numeric(df["low"], errors="coerce")
-    volume = numeric_series(df, "volume")
-    amount = numeric_series(df, "amount")
-
-    last = finite(quote.get("price")) or finite(close.iloc[-1])
-    previous = finite(quote.get("previousClose"))
-    open_price = finite(quote.get("open")) or finite(open_.iloc[0])
-    day_high = finite(quote.get("dayHigh")) or finite(high.max())
-    day_low = finite(quote.get("dayLow")) or finite(low.min())
-    change_pct = finite(quote.get("changePercent"))
-    if change_pct is None and last is not None and previous:
-        change_pct = (last - previous) / previous * 100
-
-    day_amplitude = (day_high - day_low) / previous * 100 if day_high and day_low and previous else 0
-    close_position = (last - day_low) / max(day_high - day_low, 0.01) if last and day_high and day_low else 0.5
-    intraday_return = (last - open_price) / open_price * 100 if last and open_price else 0
-    recent_return_5 = (close.iloc[-1] - close.iloc[-6]) / close.iloc[-6] * 100 if len(close) > 6 and close.iloc[-6] else 0
-    volume_ratio = finite(metrics.get("volumeRatio")) or 1
-    rsi14 = finite(metrics.get("rsi14")) or 50
-    order_imbalance = finite(order_book.get("imbalance")) or 0
-    turnover_value = finite(amount.tail(20).sum()) or finite(quote.get("amount")) or 0
-    avg_amount = finite(amount.tail(20).mean()) or 0
-    amount_surge = amount.iloc[-1] / max(amount.tail(30).mean(), 1) if len(amount) >= 30 and amount.tail(30).mean() else 1
-    upper_shadow = (day_high - last) / max(day_high - day_low, 0.01) if day_high and day_low and last else 0
-    limit_pct = 20 if previous and previous < 1 else 10
-    distance_to_limit = ((previous * (1 + limit_pct / 100)) - last) / previous * 100 if previous and last else 99
-
-    accumulation_score = 35
-    accumulation_reasons = []
-    if volume_ratio >= 1.25:
-        accumulation_score += 18
-        accumulation_reasons.append(f"量能放大 {volume_ratio:.2f}x")
-    if abs(change_pct or 0) <= 2.5 and day_amplitude <= 5.5:
-        accumulation_score += 18
-        accumulation_reasons.append("放量但价格波动受控")
-    if close_position >= 0.45 and order_imbalance >= -0.15:
-        accumulation_score += 14
-        accumulation_reasons.append("收盘位置不弱且盘口未明显失衡")
-    if avg_amount > 0:
-        accumulation_score += 8
-        accumulation_reasons.append("成交额连续性可用")
-    if upper_shadow > 0.45:
-        accumulation_score -= 18
-        accumulation_reasons.append("上影线偏长，吸筹信号打折")
-
-    ignition_score = 20
-    ignition_reasons = []
-    if change_pct is not None and change_pct >= 3:
-        ignition_score += 25
-        ignition_reasons.append(f"涨幅达到 {change_pct:.2f}%")
-    if recent_return_5 >= 1.5:
-        ignition_score += 18
-        ignition_reasons.append(f"近5根快速拉升 {recent_return_5:.2f}%")
-    if amount_surge >= 1.8 or volume_ratio >= 1.8:
-        ignition_score += 20
-        ignition_reasons.append("分时成交明显脉冲放大")
-    if close_position >= 0.72:
-        ignition_score += 12
-        ignition_reasons.append("价格靠近日内高位")
-    if order_imbalance > 0.2:
-        ignition_score += 10
-        ignition_reasons.append("买盘量差占优")
-
-    dde_signal = build_dde_signal(fund_flow or estimate_dde_flow(quote, candles, order_book))
-    dde_metrics = dde_signal.get("metrics") or {}
-    dde_score = finite(dde_signal.get("score")) or 50
-    dde_main_ratio = finite(dde_metrics.get("mainNetInflowRatio")) or 0
-    if dde_score >= 65:
-        accumulation_score += 10
-        accumulation_reasons.append(f"DDE资金流{dde_signal['label']}")
-    if dde_score >= 72 and dde_main_ratio > 0:
-        ignition_score += 8
-        ignition_reasons.append("DDE大单资金配合上攻")
-    if dde_score <= 35 and dde_main_ratio < 0:
-        accumulation_score -= 10
-        accumulation_reasons.append("DDE显示主力净流出")
-
-    bull_trap_score = 18
-    bull_trap_reasons = []
-    if upper_shadow >= 0.45 and change_pct and change_pct > 0:
-        bull_trap_score += 26
-        bull_trap_reasons.append("冲高回落，上影线偏长")
-    if volume_ratio >= 1.6 and close_position <= 0.45:
-        bull_trap_score += 24
-        bull_trap_reasons.append("放量但收盘位置偏低")
-    if rsi14 >= 72:
-        bull_trap_score += 14
-        bull_trap_reasons.append(f"RSI {rsi14:.1f} 偏热")
-    if order_imbalance < -0.15:
-        bull_trap_score += 12
-        bull_trap_reasons.append("卖盘量差占优")
-    if dde_score <= 35:
-        bull_trap_score += 10
-        bull_trap_reasons.append("DDE资金流偏流出")
-    if change_pct is not None and change_pct < -1:
-        bull_trap_score -= 8
-
-    limit_score = 8
-    limit_reasons = []
-    if change_pct is not None:
-        limit_score += clamp(change_pct * 6, -15, 45)
-        limit_reasons.append(f"当前涨幅 {change_pct:.2f}%")
-    if distance_to_limit <= 3:
-        limit_score += 24
-        limit_reasons.append(f"距涨停约 {distance_to_limit:.2f}%")
-    if ignition_score >= 65:
-        limit_score += 16
-        limit_reasons.append("点火特征较强")
-    if volume_ratio >= 1.8:
-        limit_score += 12
-        limit_reasons.append("量能支持上攻")
-    if dde_score >= 70:
-        limit_score += 10
-        limit_reasons.append("DDE资金流入强化封板动能")
-    if bull_trap_score >= 65:
-        limit_score -= 22
-        limit_reasons.append("诱多风险压低封板概率")
-    if close_position < 0.6:
-        limit_score -= 12
-
-    risk_score = 30
-    risk_reasons = []
-    if bull_trap_score >= 60:
-        risk_score += 25
-        risk_reasons.append("诱多信号偏强")
-    if day_amplitude >= 6:
-        risk_score += 15
-        risk_reasons.append(f"日内振幅 {day_amplitude:.2f}% 偏大")
-    if rsi14 >= 75:
-        risk_score += 14
-        risk_reasons.append(f"RSI {rsi14:.1f} 过热")
-    if order_imbalance < -0.25:
-        risk_score += 12
-        risk_reasons.append("卖盘压力较大")
-    if dde_score <= 32:
-        risk_score += 14
-        risk_reasons.append("DDE显示资金流出压力")
-    if accumulation_score >= 70 and bull_trap_score < 50:
-        risk_score -= 10
-        risk_reasons.append("吸筹特征缓和短线风险")
-    if dde_score >= 68 and bull_trap_score < 55:
-        risk_score -= 8
-        risk_reasons.append("DDE资金承接改善风险")
-    if turnover_value <= 0:
-        risk_score += 8
-        risk_reasons.append("成交额数据不足")
-
-    risk_score = clamp(risk_score)
-    risk_label = "高" if risk_score >= 70 else "中" if risk_score >= 45 else "低"
-
-    return {
-        "mainAccumulation": {
-            "score": round(clamp(accumulation_score)),
-            "label": label_by_score(accumulation_score, "较强", "观察", "较弱"),
-            "reasons": accumulation_reasons[:4] or ["暂未出现明显吸筹特征"],
-        },
-        "hotMoneyIgnition": {
-            "score": round(clamp(ignition_score)),
-            "label": label_by_score(ignition_score, "明显", "观察", "不明显"),
-            "reasons": ignition_reasons[:4] or ["暂未出现明显点火脉冲"],
-        },
-        "mainChartMacd": main_chart_macd,
-        "secondsMacd": seconds_macd,
-        "ddeFlow": dde_signal,
-        "bullTrap": {
-            "score": round(clamp(bull_trap_score)),
-            "label": label_by_score(bull_trap_score, "高", "观察", "低"),
-            "reasons": bull_trap_reasons[:4] or ["诱多特征暂不明显"],
-        },
-        "limitUpProbability": {
-            "score": round(clamp(limit_score)),
-            "label": label_by_score(limit_score, "较高", "中等", "较低"),
-            "reasons": limit_reasons[:4] or ["距离涨停较远，封板动能不足"],
-        },
-        "riskLevel": {
-            "score": round(risk_score),
-            "label": risk_label,
-            "reasons": risk_reasons[:4] or ["风险处于常规区间"],
-        },
-        "raw": {
-            "changePercent": change_pct,
-            "dayAmplitude": day_amplitude,
-            "closePosition": close_position,
-            "recentReturn5": recent_return_5,
-            "orderImbalance": order_imbalance,
-        },
-    }
-
-
-def detect_kline_patterns(candles: list[dict[str, Any]], metrics: dict[str, Any]) -> dict[str, Any]:
-    df = pd.DataFrame(candles)
-    if len(df) < 5:
-        return {
-            "trend": {"label": "不足", "score": 0, "reasons": ["K线数量不足"]},
-            "patterns": [],
-            "supportResistance": {
-                "support": metrics.get("support"),
-                "resistance": metrics.get("resistance"),
-                "position": "未知",
-            },
-            "summary": "K线数据不足，无法识别形态。",
-        }
-
-    close = pd.to_numeric(df["close"], errors="coerce")
-    open_ = pd.to_numeric(df["open"], errors="coerce")
-    high = pd.to_numeric(df["high"], errors="coerce")
-    low = pd.to_numeric(df["low"], errors="coerce")
-    volume = numeric_series(df, "volume")
-
-    recent = df.tail(30).copy()
-    last_open = finite(open_.iloc[-1]) or 0
-    last_close = finite(close.iloc[-1]) or 0
-    last_high = finite(high.iloc[-1]) or 0
-    last_low = finite(low.iloc[-1]) or 0
-    prev_open = finite(open_.iloc[-2]) or 0
-    prev_close = finite(close.iloc[-2]) or 0
-    body = abs(last_close - last_open)
-    candle_range = max(last_high - last_low, 0.01)
-    upper_shadow = (last_high - max(last_open, last_close)) / candle_range
-    lower_shadow = (min(last_open, last_close) - last_low) / candle_range
-    body_ratio = body / candle_range
-    volume_ratio = (volume.iloc[-1] / max(volume.tail(30).mean(), 1)) if len(volume) >= 30 else 1
-    ma5 = close.tail(5).mean()
-    ma10 = close.tail(10).mean() if len(close) >= 10 else ma5
-    ma20 = close.tail(20).mean() if len(close) >= 20 else ma10
-    slope_5 = (close.iloc[-1] - close.iloc[-6]) / close.iloc[-6] * 100 if len(close) > 6 and close.iloc[-6] else 0
-    slope_20 = (close.iloc[-1] - close.iloc[-21]) / close.iloc[-21] * 100 if len(close) > 21 and close.iloc[-21] else slope_5
-    resistance = finite(high.tail(30).max())
-    support = finite(low.tail(30).min())
-    position = "中位"
-    if support is not None and resistance is not None and last_close:
-        pos_value = (last_close - support) / max(resistance - support, 0.01)
-        if pos_value >= 0.75:
-            position = "接近压力"
-        elif pos_value <= 0.25:
-            position = "接近支撑"
-
-    trend_score = 50
-    trend_reasons = []
-    if ma5 > ma10 > ma20:
-        trend_score += 22
-        trend_reasons.append("短中期均线多头排列")
-    elif ma5 < ma10 < ma20:
-        trend_score -= 22
-        trend_reasons.append("短中期均线空头排列")
-    if slope_5 > 1:
-        trend_score += 12
-        trend_reasons.append(f"近5根上涨 {slope_5:.2f}%")
-    elif slope_5 < -1:
-        trend_score -= 12
-        trend_reasons.append(f"近5根下跌 {abs(slope_5):.2f}%")
-    if slope_20 > 3:
-        trend_score += 10
-        trend_reasons.append("20周期趋势向上")
-    elif slope_20 < -3:
-        trend_score -= 10
-        trend_reasons.append("20周期趋势向下")
-
-    trend_score = clamp(trend_score)
-    trend_label = "上升趋势" if trend_score >= 65 else "下降趋势" if trend_score <= 35 else "震荡趋势"
-
-    patterns = []
-
-    def add_pattern(name: str, direction: str, strength: float, reason: str) -> None:
-        patterns.append(
-            {
-                "name": name,
-                "direction": direction,
-                "strength": round(clamp(strength)),
-                "reason": reason,
-            }
-        )
-
-    if body_ratio <= 0.18:
-        add_pattern("十字星", "中性", 45 + min(volume_ratio * 8, 20), "实体很小，短线多空分歧加大")
-    if lower_shadow >= 0.55 and body_ratio <= 0.35:
-        add_pattern("锤头线", "看多", 58 + min(volume_ratio * 10, 25), "下影线较长，低位承接增强")
-    if upper_shadow >= 0.55 and body_ratio <= 0.35:
-        add_pattern("射击之星", "看空", 58 + min(volume_ratio * 10, 25), "上影线较长，冲高抛压明显")
-    if last_close > last_open and prev_close < prev_open and last_close >= prev_open and last_open <= prev_close:
-        add_pattern("阳包阴", "看多", 72, "最新阳线反包前一根阴线")
-    if last_close < last_open and prev_close > prev_open and last_open >= prev_close and last_close <= prev_open:
-        add_pattern("阴包阳", "看空", 72, "最新阴线吞没前一根阳线")
-    if len(close) >= 3:
-        c1, c2, c3 = close.iloc[-3], close.iloc[-2], close.iloc[-1]
-        o1, o2, o3 = open_.iloc[-3], open_.iloc[-2], open_.iloc[-1]
-        if c1 < o1 and abs(c2 - o2) / max(high.iloc[-2] - low.iloc[-2], 0.01) < 0.3 and c3 > o3 and c3 > (o1 + c1) / 2:
-            add_pattern("早晨之星", "看多", 78, "三根K线出现弱转强结构")
-        if c1 > o1 and abs(c2 - o2) / max(high.iloc[-2] - low.iloc[-2], 0.01) < 0.3 and c3 < o3 and c3 < (o1 + c1) / 2:
-            add_pattern("黄昏之星", "看空", 78, "三根K线出现强转弱结构")
-    if resistance and last_close > resistance * 0.995 and volume_ratio >= 1.4:
-        add_pattern("放量突破", "看多", 76, "价格接近或突破近期压力且量能放大")
-    if support and last_close < support * 1.005 and volume_ratio >= 1.4:
-        add_pattern("放量破位", "看空", 76, "价格接近或跌破近期支撑且量能放大")
-
-    patterns = sorted(patterns, key=lambda item: item["strength"], reverse=True)[:5]
-    if not patterns:
-        add_pattern("无明显形态", "中性", 30, "最近K线未形成高置信度经典形态")
-
-    summary = f"{trend_label}，当前位置{position}。"
-    if patterns:
-        top = patterns[0]
-        summary += f" 主要形态：{top['name']}（{top['direction']}，强度{top['strength']}）。"
-
-    return {
-        "trend": {"label": trend_label, "score": round(trend_score), "reasons": trend_reasons[:4] or ["均线和斜率信号不明显"]},
-        "patterns": patterns,
-        "supportResistance": {"support": support, "resistance": resistance, "position": position},
-        "summary": summary,
-    }
-
-
-def heuristic_analysis(
-    symbol: str,
-    quote: dict[str, Any],
-    candles: list[dict[str, Any]],
-    order_book: dict[str, Any],
-    fund_flow: dict[str, Any] | None = None,
-    realtime_ticks: list[dict[str, Any]] | None = None,
-    range_name: str | None = None,
-    interval: str | None = None,
-) -> dict[str, Any]:
-    metrics = compute_indicators(candles)
-    signals = build_market_signals(quote, candles, order_book, metrics, fund_flow, realtime_ticks, range_name, interval)
-    kline = detect_kline_patterns(candles, metrics)
-    last = quote.get("price") or (candles[-1]["close"] if candles else None)
-    score = 0.0
-    reasons = []
-    risks = []
-
-    if last and metrics["ma20"]:
-        above = (last - metrics["ma20"]) / metrics["ma20"]
-        score += 1 if above > 0 else -1
-        reasons.append(f"价格{'站上' if above > 0 else '跌破'}20周期均线 {abs(above * 100):.2f}%")
-    if metrics["ma20"] and metrics["ma60"]:
-        score += 1 if metrics["ma20"] > metrics["ma60"] else -1
-        reasons.append(f"20周期均线{'高于' if metrics['ma20'] > metrics['ma60'] else '低于'}60周期均线")
-    if metrics["rsi14"] is not None:
-        if metrics["rsi14"] > 70:
-            score -= 0.5
-            risks.append("RSI处于偏热区间，追高回撤风险上升")
-        elif metrics["rsi14"] < 30:
-            score += 0.5
-            risks.append("RSI处于偏冷区间，反弹和弱势延续都需要观察")
+# Local analysis has moved to backend.analysis. main.py keeps API routes,
+# provider adapters, persistence, and third-party AI orchestration.
+
+
+async def ai_analysis_blocking_legacy(payload: dict[str, Any], heuristic: dict[str, Any]) -> dict[str, Any]:
+    provider = os.getenv("AI_PROVIDER", "openai").lower()
+    timeout = finite(os.getenv("THIRD_PARTY_AI_TIMEOUT")) or 20
+    min_interval = finite(os.getenv("THIRD_PARTY_AI_MIN_INTERVAL")) or 300
+    symbol = normalize_market_response_symbol(str(payload.get("symbol", "UNKNOWN")))
+    range_name = str(payload.get("range") or "")
+    interval = str(payload.get("interval") or "")
+    key = f"ai:third_party:v3:{provider}:{symbol}:{range_name}:{interval}"
+
+    cached = cache_get(key, min_interval)
+    if cached is not None:
+        return {**cached, "cached": True, "aiReason": cached.get("aiReason") or f"第三方API低频缓存，{min_interval:.0f}s 内不重复请求。"}
+
+    try:
+        # 第三方AI只做低频补充判断，避免拥塞时每轮行情刷新都打到外部API。
+        if provider == "gemini":
+            result = await asyncio.wait_for(gemini_analysis(payload, heuristic), timeout=timeout)
         else:
-            reasons.append(f"RSI {metrics['rsi14']:.1f}，动能未进入极端区")
-    if metrics["volumeRatio"] and metrics["volumeRatio"] > 1.4:
-        score += 0.8 if (quote.get("changePercent") or 0) >= 0 else -0.8
-        reasons.append(f"近5根成交量约为基准的 {metrics['volumeRatio']:.2f} 倍")
-    if order_book.get("imbalance") is not None:
-        score += order_book["imbalance"] * 1.5
-        reasons.append(f"盘口买卖量差 {order_book['imbalance'] * 100:.1f}%")
-    dde_flow = signals.get("ddeFlow") or {}
-    dde_score = finite(dde_flow.get("score")) or 50
-    if dde_score >= 68:
-        score += 0.8
-        reasons.append(f"DDE资金流{dde_flow.get('label', '流入')}")
-    elif dde_score <= 32:
-        score -= 0.8
-        risks.append(f"DDE资金流{dde_flow.get('label', '流出')}")
+            result = await asyncio.wait_for(openai_analysis(payload, heuristic), timeout=timeout)
+    except asyncio.TimeoutError:
+        result = third_party_unavailable(provider, "timeout", f"第三方API超过 {timeout:.0f}s 未返回，已先展示本地AI判断。")
 
-    direction = "偏多" if score > 1.1 else "偏空" if score < -1.1 else "震荡"
-    main_chart_macd = signals.get("mainChartMacd") or {}
-    if main_chart_macd.get("action") == "BUY_BIAS":
-        score += 0.9
-        reasons.append("主图MACD偏多，当前主图周期动能改善")
-    elif main_chart_macd.get("action") == "SELL_BIAS":
-        score -= 0.9
-        risks.append("主图MACD偏空，当前主图周期动能转弱")
+    return cache_set(key, result, min_interval)
 
-    seconds_macd = signals.get("secondsMacd") or {}
-    if seconds_macd.get("action") == "STRONG_BUY":
-        score += 2
-        reasons.append("秒级MACD强买：零轴上方红柱放大、突破3分钟高点并放量")
-    elif seconds_macd.get("action") == "BUY":
-        score += 1
-        reasons.append("秒级MACD偏多，短线动能改善")
-    elif seconds_macd.get("action") == "SELL":
-        score -= 2
-        risks.append("秒级MACD卖出/止盈，短线动能转弱")
 
-    direction = "偏多" if score > 1.1 else "偏空" if score < -1.1 else "震荡"
-    confidence = max(35, min(88, 48 + abs(score) * 13 + min(metrics.get("volumeRatio") or 1, 2) * 4))
-    action = {
-        "偏多": "关注回踩均线后的承接，避免直接追涨。",
-        "偏空": "关注反抽压力和止损纪律，弱势下不急于抄底。",
-        "震荡": "等待放量突破或跌破区间后再提高仓位。",
-    }[direction]
-    if metrics["support"] and metrics["resistance"]:
-        risks.append(f"近20周期压力约 {metrics['resistance']:.2f}，支撑约 {metrics['support']:.2f}")
-    risks.extend(signals["riskLevel"]["reasons"][:2])
-    risks.extend((signals.get("mainChartMacd") or {}).get("risks", [])[:1])
-    risks.extend((signals.get("secondsMacd") or {}).get("risks", [])[:2])
+async def request_third_party_ai(provider: str, payload: dict[str, Any], heuristic: dict[str, Any], timeout: float) -> dict[str, Any]:
+    try:
+        # Third-party AI is supplementary. Keep it bounded so local AI can stay responsive.
+        if provider == "gemini":
+            return await asyncio.wait_for(gemini_analysis(payload, heuristic), timeout=timeout)
+        return await asyncio.wait_for(openai_analysis(payload, heuristic), timeout=timeout)
+    except asyncio.TimeoutError:
+        return third_party_unavailable(provider, "timeout", f"第三方API超过 {timeout:.0f}s 未返回，已先展示本地AI判断。")
 
-    signal_summary = (
-        f"主力吸筹{signals['mainAccumulation']['label']}，"
-        f"游资点火{signals['hotMoneyIgnition']['label']}，"
-        f"DDE资金流{signals['ddeFlow']['label']}，"
-        f"诱多风险{signals['bullTrap']['label']}，"
-        f"封板概率{signals['limitUpProbability']['score']}%，"
-        f"风险等级{signals['riskLevel']['label']}。"
-        f"K线：{kline['summary']}"
-    )
 
-    return {
-        "engine": "heuristic",
-        "symbol": symbol,
-        "direction": direction,
-        "confidence": round(confidence),
-        "score": round(score, 2),
-        "summary": f"{symbol} 当前判断为{direction}，置信度 {round(confidence)}%。{signal_summary}{action}",
-        "metrics": metrics,
-        "signals": signals,
-        "kline": kline,
-        "reasons": reasons[:5],
-        "risks": risks[:4],
-        "disclaimer": "仅用于行情研究和策略辅助，不构成投资建议。",
-    }
+async def refresh_third_party_ai_cache(
+    key: str,
+    provider: str,
+    payload: dict[str, Any],
+    heuristic: dict[str, Any],
+    timeout: float,
+    min_interval: float,
+) -> None:
+    try:
+        result = await request_third_party_ai(provider, payload, heuristic, timeout)
+        cache_set(key, result, min_interval)
+    finally:
+        third_party_ai_pending.discard(key)
 
 
 async def ai_analysis(payload: dict[str, Any], heuristic: dict[str, Any]) -> dict[str, Any]:
     provider = os.getenv("AI_PROVIDER", "openai").lower()
-    if provider == "gemini":
-        return await gemini_analysis(payload, heuristic)
-    return await openai_analysis(payload, heuristic)
+    timeout = finite(os.getenv("THIRD_PARTY_AI_TIMEOUT")) or 20
+    min_interval = finite(os.getenv("THIRD_PARTY_AI_MIN_INTERVAL")) or 300
+    symbol = normalize_market_response_symbol(str(payload.get("symbol", "UNKNOWN")))
+    range_name = str(payload.get("range") or "")
+    interval = str(payload.get("interval") or "")
+    key = f"ai:third_party:v3:{provider}:{symbol}:{range_name}:{interval}"
+
+    cached = cache_get(key, min_interval)
+    if cached is not None:
+        return {**cached, "cached": True, "aiReason": cached.get("aiReason") or f"第三方API低频缓存，{min_interval:.0f}s 内不重复请求。"}
+
+    if payload.get("enableThirdPartyAi") is False:
+        return third_party_unavailable(provider, "disabled", "第三方AI开关已关闭，且当前标的暂无缓存结果。")
+
+    if key not in third_party_ai_pending:
+        third_party_ai_pending.add(key)
+        payload_copy = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+        heuristic_copy = json.loads(json.dumps(heuristic, ensure_ascii=False, default=str))
+        asyncio.create_task(refresh_third_party_ai_cache(key, provider, payload_copy, heuristic_copy, timeout, min_interval))
+
+    return third_party_unavailable(provider, "pending", "第三方AI已转入后台低频请求，本地AI判断先返回；结果会在后续刷新中显示。")
 
 
 def third_party_unavailable(provider: str, status: str, reason: str, request_id: str | None = None) -> dict[str, Any]:
@@ -2842,8 +1732,17 @@ def compact_payload(payload: dict[str, Any], heuristic: dict[str, Any]) -> dict[
             "provider": (payload.get("orderBook") or {}).get("provider"),
         },
         "fundFlow": payload.get("fundFlow"),
-        "recentCandles": (payload.get("candles") or [])[-80:],
-        "heuristic": heuristic,
+        "recentCandles": (payload.get("candles") or [])[-24:],
+        "heuristic": {
+            "direction": heuristic.get("direction"),
+            "confidence": heuristic.get("confidence"),
+            "summary": heuristic.get("summary"),
+            "metrics": heuristic.get("metrics"),
+                "signals": heuristic.get("signals"),
+            "kline": heuristic.get("kline"),
+            "reasons": heuristic.get("reasons"),
+            "risks": heuristic.get("risks"),
+        },
     }
 
 
@@ -2856,14 +1755,32 @@ async def openai_analysis(payload: dict[str, Any], heuristic: dict[str, Any]) ->
 
     body = {
         "model": os.getenv("OPENAI_MODEL", "gpt-5-mini"),
+        "max_output_tokens": int(finite(os.getenv("OPENAI_MAX_OUTPUT_TOKENS")) or 1000),
         "input": [
             {"role": "system", "content": "你是股票行情研究助手。基于报价、盘口和K线指标给出短线行情解读。必须强调不构成投资建议。输出JSON。"},
-            {"role": "user", "content": f"请分析以下行情数据，返回字段：direction, confidence, summary, reasons, risks, metrics, signals, kline。signals 必须包含 mainAccumulation, hotMoneyIgnition, mainChartMacd, secondsMacd, ddeFlow, bullTrap, limitUpProbability, riskLevel，每项包含 score, label, reasons。mainChartMacd 基于主图 candles，secondsMacd 基于独立当日秒级/分时数据。kline 必须包含 trend, patterns, supportResistance, summary。\n{json.dumps(compact_payload(payload, heuristic), ensure_ascii=False)}"},
+            {"role": "user", "content": f"请分析以下行情数据，返回字段：direction, confidence, summary, reasons, risks, metrics, signals, kline。signals 必须包含 mainAccumulation, hotMoneyIgnition, mainChartMacd, secondsMacd, wyckoff, ddeFlow, bullTrap, limitUpProbability, riskLevel，每项包含 score, label, reasons。mainChartMacd 基于主图 candles，secondsMacd 基于独立当日秒级/分时数据，wyckoff 包含阶段A-E、事件和买卖信号。kline 必须包含 trend, patterns, supportResistance, summary。\n{json.dumps(compact_payload(payload, heuristic), ensure_ascii=False)}"},
         ],
         "text": {"format": {"type": "json_object"}},
     }
+    reasoning_effort = os.getenv("OPENAI_REASONING_EFFORT", "").strip()
+    if reasoning_effort:
+        body["reasoning"] = {"effort": reasoning_effort}
+    body["input"] = [
+        {"role": "system", "content": "你是股票行情研究助手。只输出简短 JSON，不构成投资建议。"},
+        {
+            "role": "user",
+            "content": (
+                "基于以下本地AI结果做复核，返回严格JSON，只包含 direction, confidence, summary, reasons, risks。"
+                "direction只能是偏多/偏空/震荡；confidence为0-100整数；summary不超过80字；"
+                "reasons最多3条，每条不超过30字；risks最多3条，每条不超过30字。\n"
+                f"{json.dumps(compact_payload(payload, heuristic), ensure_ascii=False)}"
+            ),
+        },
+    ]
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        request_timeout = finite(os.getenv("THIRD_PARTY_AI_TIMEOUT")) or 20
+        timeout_config = httpx.Timeout(request_timeout, connect=3.0, read=request_timeout, write=3.0, pool=3.0)
+        async with httpx.AsyncClient(timeout=timeout_config) as client:
             response = await client.post(
                 "https://api.openai.com/v1/responses",
                 headers={"authorization": f"Bearer {api_key}", "content-type": "application/json"},
@@ -2896,7 +1813,7 @@ async def gemini_analysis(payload: dict[str, Any], heuristic: dict[str, Any]) ->
     prompt = (
         "你是股票行情研究助手。基于报价、盘口和K线指标给出短线行情解读。"
         "返回严格JSON，字段：direction, confidence, summary, reasons, risks, metrics, signals, kline。"
-        "signals 必须包含 mainAccumulation, hotMoneyIgnition, mainChartMacd, secondsMacd, ddeFlow, bullTrap, limitUpProbability, riskLevel，每项包含 score, label, reasons。"
+        "signals 必须包含 mainAccumulation, hotMoneyIgnition, mainChartMacd, secondsMacd, wyckoff, ddeFlow, bullTrap, limitUpProbability, riskLevel，每项包含 score, label, reasons。"
         "mainChartMacd 基于主图 candles，secondsMacd 基于独立当日秒级/分时数据。"
         "kline 必须包含 trend, patterns, supportResistance, summary。"
         "必须强调不构成投资建议。\n"
@@ -2944,6 +1861,7 @@ async def health():
             "moomooHost": moomoo_host(),
             "moomooPort": moomoo_port(),
             "ifindEnabled": ifind_enabled(),
+            "ifindPushEnabled": ifind_push_enabled(),
             "ifindAccessTokenVisible": bool(os.getenv("IFIND_ACCESS_TOKEN")),
             "ifindRefreshTokenVisible": bool(os.getenv("IFIND_REFRESH_TOKEN")),
             "enabled": bool(os.getenv("OPENAI_API_KEY")) if provider == "openai" else bool(os.getenv("GEMINI_API_KEY")),
@@ -3072,6 +1990,26 @@ async def market(symbol: str = "600519", range: str = "1d", interval: str = "1m"
 async def realtime_quote(symbol: str = "600519"):
     a_share = normalize_a_share_symbol(symbol)
     if a_share:
+        pushed_quote = get_ifind_push_quote(a_share["display"])
+        if pushed_quote:
+            price = finite(pushed_quote.get("price"))
+            if price is not None:
+                return {
+                    "symbol": a_share["display"],
+                    "name": pushed_quote.get("name") or a_share["display"],
+                    "marketType": "cn",
+                    "currency": "CNY",
+                    "provider": "iFinD Push",
+                    "quoteTime": pushed_quote.get("quoteTime"),
+                    "updatedAt": now_iso(),
+                    "pushedAt": pushed_quote.get("pushedAt"),
+                    "pushAgeSeconds": pushed_quote.get("ageSeconds"),
+                    "price": price,
+                    "change": finite(pushed_quote.get("change")),
+                    "changePercent": finite(pushed_quote.get("changePercent")),
+                    "volume": finite(pushed_quote.get("volume")),
+                    "amount": finite(pushed_quote.get("amount")),
+                }
         try:
             data = await ifind_realtime_quote(a_share, ttl=1)
             quote = data.get("quote") or {}
@@ -3114,6 +2052,8 @@ async def realtime_quote(symbol: str = "600519"):
             }
 
     normalized_symbol = symbol.strip().upper()
+    if re.match(r"^\d{1,5}$", normalized_symbol):
+        raise HTTPException(status_code=400, detail="Incomplete A-share symbol")
     if not re.match(r"^[A-Z0-9.\-=^]{1,20}$", normalized_symbol):
         raise HTTPException(status_code=400, detail="Invalid symbol")
     try:
@@ -3142,6 +2082,22 @@ async def realtime_quote(symbol: str = "600519"):
         raise HTTPException(status_code=502, detail=f"realtime quote unavailable: {exc}") from exc
 
 
+@app.get("/api/ifind/push/ticks")
+async def ifind_push_ticks(symbol: str = "600519", limit: int = 200):
+    a_share = normalize_a_share_symbol(symbol)
+    if not a_share:
+        raise HTTPException(status_code=400, detail="Only A-share symbols are supported")
+    ticks = get_ifind_push_ticks(a_share["display"], limit=limit)
+    latest = get_ifind_push_quote(a_share["display"])
+    return {
+        "symbol": a_share["display"],
+        "enabled": ifind_push_enabled(),
+        "count": len(ticks),
+        "latest": latest,
+        "ticks": ticks,
+    }
+
+
 @app.post("/api/analyze")
 async def analyze(request: Request):
     raw_body = await request.body()
@@ -3149,7 +2105,7 @@ async def analyze(request: Request):
         payload = json.loads(raw_body.decode("utf-8"))
     except UnicodeDecodeError:
         payload = json.loads(raw_body.decode("gb18030", errors="replace"))
-    heuristic = heuristic_analysis(
+    heuristic = run_local_analysis(
         payload.get("symbol", "UNKNOWN"),
         payload.get("quote") or {},
         payload.get("candles") or [],

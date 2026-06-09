@@ -31,6 +31,8 @@
   statusBadge: document.querySelector("#statusBadge"),
   canvas: document.querySelector("#klineCanvas"),
   secondCanvas: document.querySelector("#secondCanvas"),
+  secondsMacdCanvas: document.querySelector("#secondsMacdCanvas"),
+  secondsMacdSignal: document.querySelector("#secondsMacdSignal"),
   secondSource: document.querySelector("#secondSource"),
   secondPrice: document.querySelector("#secondPrice"),
   secondChange: document.querySelector("#secondChange"),
@@ -44,6 +46,7 @@
   directionPill: document.querySelector("#directionPill"),
   summaryText: document.querySelector("#summaryText"),
   thirdPartyEngine: document.querySelector("#thirdPartyEngine"),
+  thirdPartyModes: document.querySelectorAll("input[name='thirdPartyMode']"),
   thirdPartyNotice: document.querySelector("#thirdPartyNotice"),
   thirdPartyDirection: document.querySelector("#thirdPartyDirection"),
   thirdPartyConfidence: document.querySelector("#thirdPartyConfidence"),
@@ -58,6 +61,8 @@
   hotMoneyIgnition: document.querySelector("#hotMoneyIgnition"),
   mainChartMacd: document.querySelector("#mainChartMacd"),
   secondsMacd: document.querySelector("#secondsMacd"),
+  wyckoffPhase: document.querySelector("#wyckoffPhase"),
+  wyckoffSignal: document.querySelector("#wyckoffSignal"),
   ddeFlow: document.querySelector("#ddeFlow"),
   bullTrap: document.querySelector("#bullTrap"),
   limitUpProbability: document.querySelector("#limitUpProbability"),
@@ -73,6 +78,9 @@ const state = {
   secondTimer: null,
   secondAbort: null,
   abort: null,
+  analysisAbort: null,
+  analysisKey: null,
+  analysisInFlight: false,
   market: null,
   realtimeSymbol: null,
   realtimeTicks: [],
@@ -324,6 +332,237 @@ function resetRealtime(symbol) {
   state.realtimeSymbol = symbol;
   state.realtimeTicks = [];
   drawSecondChart();
+  drawSecondsMacdChart();
+}
+
+function buildRealtimeBars(ticks, intervalMs = 3000) {
+  const rows = ticks
+    .map((tick) => ({
+      time: Number(tick.time),
+      price: Number(tick.price),
+      volume: Number(tick.volume),
+      amount: Number(tick.amount)
+    }))
+    .filter((row) => Number.isFinite(row.time) && Number.isFinite(row.price))
+    .sort((a, b) => a.time - b.time);
+
+  let previousVolume = null;
+  let previousAmount = null;
+  const bars = [];
+  for (const row of rows) {
+    const deltaVolume = Number.isFinite(row.volume) && previousVolume !== null ? Math.max(0, row.volume - previousVolume) : 0;
+    const deltaAmount = Number.isFinite(row.amount) && previousAmount !== null ? Math.max(0, row.amount - previousAmount) : 0;
+    if (Number.isFinite(row.volume)) previousVolume = row.volume;
+    if (Number.isFinite(row.amount)) previousAmount = row.amount;
+
+    const bucket = row.time - (row.time % intervalMs);
+    let bar = bars[bars.length - 1];
+    if (!bar || bar.time !== bucket) {
+      bar = {
+        time: bucket,
+        open: row.price,
+        high: row.price,
+        low: row.price,
+        close: row.price,
+        volume: deltaVolume,
+        amount: deltaAmount
+      };
+      bars.push(bar);
+      continue;
+    }
+    bar.high = Math.max(bar.high, row.price);
+    bar.low = Math.min(bar.low, row.price);
+    bar.close = row.price;
+    bar.volume += deltaVolume || 0;
+    bar.amount += deltaAmount || 0;
+  }
+  for (const bar of bars) {
+    if (!bar.volume) bar.volume = 1;
+    if (!bar.amount) bar.amount = bar.close * bar.volume;
+  }
+  return bars;
+}
+
+function ema(values, span) {
+  const alpha = 2 / (span + 1);
+  const result = [];
+  values.forEach((value, index) => {
+    result.push(index === 0 ? value : value * alpha + result[index - 1] * (1 - alpha));
+  });
+  return result;
+}
+
+function secondsMacdData() {
+  const bars = buildRealtimeBars(state.realtimeTicks);
+  if (bars.length < 35) {
+    return {
+      bars,
+      dif: [],
+      dea: [],
+      hist: [],
+      signal: { label: "不足", action: "wait", score: 0, reason: "至少需要35根3秒bar" }
+    };
+  }
+
+  const closes = bars.map((bar) => bar.close);
+  const fast = ema(closes, 12);
+  const slow = ema(closes, 26);
+  const dif = fast.map((value, index) => value - slow[index]);
+  const dea = ema(dif, 9);
+  const hist = dif.map((value, index) => (value - dea[index]) * 2);
+  const times = bars.map((bar) => bar.time);
+  const highs = bars.map((bar) => bar.high);
+  const volumes = bars.map((bar) => bar.volume || 1);
+  const amounts = bars.map((bar) => bar.amount || bar.close * (bar.volume || 1));
+  const lastIndex = bars.length - 1;
+  const lastTime = times[lastIndex];
+  const recentHighs = highs.filter((_, index) => times[index] >= lastTime - 180000 && index < lastIndex);
+  const recentVolumes = volumes.filter((_, index) => times[index] >= lastTime - 60000 && index < lastIndex);
+  const recentHigh = recentHighs.length ? Math.max(...recentHighs) : Math.max(...highs.slice(Math.max(0, highs.length - 61), -1));
+  const avgVolume = recentVolumes.length ? recentVolumes.reduce((sum, value) => sum + value, 0) / recentVolumes.length : 1;
+  const volumeMultiplier = volumes[lastIndex] / Math.max(avgVolume, 1);
+  const intradayAmount = amounts.reduce((sum, value) => sum + value, 0);
+  const intradayVolume = volumes.reduce((sum, value) => sum + value, 0);
+  const vwap = intradayAmount && intradayVolume ? intradayAmount / intradayVolume : null;
+  const shortEma = ema(closes, 10).at(-1);
+  const histTail = hist.slice(-4);
+  const histExpanding3 = histTail.length >= 3 && histTail.at(-3) > 0 && histTail.at(-2) > histTail.at(-3) && histTail.at(-1) > histTail.at(-2);
+  const histShrinking3 = histTail.length >= 3 && histTail.at(-3) > 0 && histTail.at(-2) < histTail.at(-3) && histTail.at(-1) < histTail.at(-2);
+  const crossUp = dif.at(-2) <= dea.at(-2) && dif.at(-1) > dea.at(-1);
+  const crossDown = dif.at(-2) >= dea.at(-2) && dif.at(-1) < dea.at(-1);
+  const lastPrice = bars[lastIndex].close;
+  const priceBreak = Number.isFinite(recentHigh) && lastPrice > recentHigh;
+  const volumeExpand = volumeMultiplier >= 1.5;
+  const aboveVwap = vwap === null || lastPrice >= vwap;
+  const belowVwap = vwap !== null && lastPrice < vwap;
+  const belowShortEma = Number.isFinite(shortEma) && lastPrice < shortEma;
+  const strongBuy = dif.at(-1) > 0 && dea.at(-1) > 0 && histExpanding3 && priceBreak && volumeExpand;
+  const buy = !strongBuy && (crossUp || (dif.at(-1) > dea.at(-1) && hist.at(-1) > 0)) && aboveVwap && volumeMultiplier >= 1.15;
+  const sell = crossDown || histShrinking3 || (belowVwap && belowShortEma);
+
+  let score = 45;
+  if (dif.at(-1) > 0 && dea.at(-1) > 0) score += 12;
+  if (histExpanding3) score += 20;
+  if (priceBreak) score += 18;
+  if (volumeExpand) score += 14;
+  if (aboveVwap && vwap !== null) score += 6;
+  if (sell) score -= 28;
+  score = Math.round(Math.max(0, Math.min(100, score)));
+
+  const signal = strongBuy
+    ? { label: "强买", action: "strong-buy", score, reason: "零轴上方、红柱放大、突破3分钟高点并放量" }
+    : buy
+      ? { label: "买入", action: "buy", score, reason: "DIF强于DEA、VWAP上方且短线量能改善" }
+      : sell
+        ? { label: "卖出/止盈", action: "sell", score, reason: "MACD动能转弱或跌破短线均衡位" }
+        : { label: "观望", action: "wait", score, reason: "条件未共振" };
+  return { bars, dif, dea, hist, signal, volumeMultiplier, priceBreak, vwap, shortEma };
+}
+
+function macdValueText(value) {
+  if (!Number.isFinite(value)) return "--";
+  const abs = Math.abs(value);
+  const digits = abs >= 10 ? 2 : abs >= 1 ? 3 : 4;
+  return value.toFixed(digits);
+}
+
+function drawSecondsMacdChart() {
+  const canvas = els.secondsMacdCanvas;
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = Math.floor(rect.width * dpr);
+  canvas.height = Math.floor(rect.height * dpr);
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, rect.width, rect.height);
+
+  const pad = { top: 14, right: 56, bottom: 24, left: 52 };
+  const width = rect.width - pad.left - pad.right;
+  const height = rect.height - pad.top - pad.bottom;
+  ctx.strokeStyle = "#223039";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(pad.left, pad.top, width, height);
+
+  const data = secondsMacdData();
+  if (els.secondsMacdSignal) {
+    els.secondsMacdSignal.textContent = `${data.signal.label} · ${data.signal.score}`;
+    els.secondsMacdSignal.title = data.signal.reason;
+    els.secondsMacdSignal.className = data.signal.action;
+  }
+  if (els.secondsMacd) {
+    els.secondsMacd.textContent = `${data.signal.label} · ${data.signal.score}`;
+  }
+  if (data.bars.length < 35) {
+    ctx.fillStyle = "#95a3a4";
+    ctx.font = "12px Segoe UI";
+    ctx.fillText(`等待MACD数据 ${data.bars.length}/35`, pad.left + 12, pad.top + 24);
+    return;
+  }
+
+  const values = [...data.dif, ...data.dea, ...data.hist];
+  const absMax = Math.max(...values.map((value) => Math.abs(value)), 0.001);
+  const midY = pad.top + height / 2;
+  const y = (value) => midY - (value / absMax) * (height * 0.46);
+  const x = (index) => pad.left + (index / Math.max(data.bars.length - 1, 1)) * width;
+  const colors = marketColors(state.market || {});
+
+  ctx.strokeStyle = "#33434c";
+  ctx.beginPath();
+  ctx.moveTo(pad.left, midY);
+  ctx.lineTo(pad.left + width, midY);
+  ctx.stroke();
+
+  data.hist.forEach((value, index) => {
+    const px = x(index);
+    const py = y(value);
+    ctx.strokeStyle = value >= 0 ? colors.up : colors.down;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    ctx.moveTo(px, midY);
+    ctx.lineTo(px, py);
+    ctx.stroke();
+  });
+
+  const drawLine = (series, color) => {
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.7;
+    ctx.beginPath();
+    series.forEach((value, index) => {
+      const px = x(index);
+      const py = y(value);
+      if (index === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+  };
+  drawLine(data.dif, "#f1d486");
+  drawLine(data.dea, "#71a7ff");
+
+  const last = data.bars.at(-1);
+  const latestDif = data.dif.at(-1);
+  const latestDea = data.dea.at(-1);
+  const latestMacd = data.hist.at(-1);
+  const metricY = pad.top + 14;
+  ctx.fillStyle = "#95a3a4";
+  ctx.font = "11px Segoe UI";
+  ctx.fillText("DIF", pad.left + 8, metricY);
+  ctx.fillStyle = "#f1d486";
+  ctx.fillText(macdValueText(latestDif), pad.left + 32, metricY);
+
+  ctx.fillStyle = "#71a7ff";
+  ctx.fillText("DEA", pad.left + 96, metricY);
+  ctx.fillText(macdValueText(latestDea), pad.left + 124, metricY);
+
+  ctx.fillStyle = latestMacd >= 0 ? colors.up : colors.down;
+  ctx.fillText("MACD", pad.left + 188, metricY);
+  ctx.fillText(macdValueText(latestMacd), pad.left + 226, metricY);
+
+  ctx.fillStyle = "#95a3a4";
+  ctx.fillText(absMax.toFixed(4), pad.left + width + 8, pad.top + 4);
+  ctx.fillText((-absMax).toFixed(4), pad.left + width + 8, pad.top + height);
+  ctx.fillText(new Date(data.bars[0].time).toLocaleTimeString([], { hour12: false }), pad.left, pad.top + height + 18);
+  ctx.fillText(new Date(last.time).toLocaleTimeString([], { hour12: false }), pad.left + width - 56, pad.top + height + 18);
 }
 
 function drawSecondChart() {
@@ -386,7 +625,7 @@ function drawSecondChart() {
 }
 
 async function fetchRealtimeTick() {
-  const symbol = els.symbol.value.trim().toUpperCase() || "AAPL";
+  const symbol = (state.market?.symbol || els.symbol.value).trim().toUpperCase() || "AAPL";
   if (state.realtimeSymbol !== symbol) resetRealtime(symbol);
   state.secondAbort?.abort();
   state.secondAbort = new AbortController();
@@ -394,22 +633,21 @@ async function fetchRealtimeTick() {
     const response = await fetch(`/api/realtime?symbol=${encodeURIComponent(symbol)}`, { signal: state.secondAbort.signal });
     const tick = await response.json();
     if (!response.ok) throw new Error(tick.detail || tick.error || "秒级行情失败");
-    const parsedTime = tick.quoteTime ? Date.parse(tick.quoteTime) : Date.parse(tick.updatedAt);
+    const parsedTime = Date.parse(tick.pushedAt || tick.updatedAt || tick.quoteTime);
     const timeValue = Number.isFinite(parsedTime) ? parsedTime : Date.now();
-    const currentDay = todayKey(Date.now());
+    const currentDay = todayKey(timeValue);
     const sameDayTicks = state.realtimeTicks.filter((item) => todayKey(item.time) === currentDay);
-    const nextTick = { ...tick, time: timeValue, price: Number(tick.price) };
     const previous = sameDayTicks[sameDayTicks.length - 1];
+    const adjustedTime = previous && previous.time >= timeValue ? previous.time + 1000 : timeValue;
+    const nextTick = { ...tick, time: adjustedTime, price: Number(tick.price) };
     state.realtimeTicks = [...sameDayTicks, nextTick].slice(-7200);
-    if (previous && previous.time === nextTick.time && previous.price === nextTick.price) {
-      state.realtimeTicks[state.realtimeTicks.length - 1].time = Date.now();
-    }
     els.secondSource.textContent = tick.provider || "--";
     els.secondPrice.textContent = money(nextTick.price, tick.currency || state.market?.currency || "");
     els.secondChange.textContent = `${Number(tick.change) >= 0 ? "+" : ""}${money(Number(tick.change))} (${pct(Number(tick.changePercent))})`;
     els.secondChange.className = Number(tick.change) >= 0 ? marketColors(state.market || tick).upClass : marketColors(state.market || tick).downClass;
     els.secondCount.textContent = `${state.realtimeTicks.length} ticks`;
     drawSecondChart();
+    drawSecondsMacdChart();
   } catch (error) {
     if (error.name === "AbortError") return;
     if (els.secondSource) els.secondSource.textContent = error.message;
@@ -549,6 +787,11 @@ function signalText(signal, suffix = "") {
   return `${signal.label || "--"} · ${score}`;
 }
 
+function thirdPartyEnabled() {
+  const checked = Array.from(els.thirdPartyModes || []).find((item) => item.checked);
+  return (checked?.value || "on") === "on";
+}
+
 function decisionTone(text = "") {
   return text.includes("多") || text.includes("å¤š")
     ? "bullish"
@@ -584,6 +827,15 @@ function renderAnalysis(analysis) {
   els.hotMoneyIgnition.textContent = signalText(local.signals?.hotMoneyIgnition, "%");
   els.mainChartMacd.textContent = signalText(local.signals?.mainChartMacd, "");
   els.secondsMacd.textContent = signalText(local.signals?.secondsMacd, "");
+  const wyckoff = local.signals?.wyckoff;
+  if (els.wyckoffPhase) {
+    els.wyckoffPhase.textContent = wyckoff ? `阶段${wyckoff.phase || "--"} · ${wyckoff.bias || "--"}` : "--";
+    els.wyckoffPhase.title = (wyckoff?.events || []).map((event) => `${event.code}: ${event.reason}`).join("\n");
+  }
+  if (els.wyckoffSignal) {
+    els.wyckoffSignal.textContent = signalText(wyckoff, "");
+    els.wyckoffSignal.title = (wyckoff?.filters || []).map((item) => `${item.passed ? "通过" : "未过"} · ${item.name}: ${item.reason}`).join("\n");
+  }
   els.ddeFlow.textContent = signalText(local.signals?.ddeFlow, "%");
   els.bullTrap.textContent = signalText(local.signals?.bullTrap, "%");
   els.limitUpProbability.textContent = signalText(local.signals?.limitUpProbability, "%");
@@ -597,6 +849,17 @@ function renderAnalysis(analysis) {
   if (els.thirdPartyEngine) {
     const provider = thirdParty?.aiProvider || thirdParty?.engine;
     els.thirdPartyEngine.textContent = provider === "gemini" ? "Gemini" : provider === "openai" ? "OpenAI / ChatGPT" : "第三方API";
+    if (!thirdPartyEnabled() && thirdParty?.aiStatus === "disabled" && !thirdParty?.cached) {
+      els.thirdPartyDirection.textContent = "--";
+      els.thirdPartyDirection.className = "direction neutral";
+      els.thirdPartyConfidence.textContent = "--";
+      els.thirdPartySummary.textContent = "";
+      els.thirdPartyNotice.hidden = true;
+      els.thirdPartyNotice.textContent = "";
+      renderList(els.thirdPartyReasons, []);
+      renderList(els.thirdPartyRisks, []);
+      return;
+    }
     const externalDirection = thirdParty?.direction || "--";
     els.thirdPartyDirection.textContent = externalDirection;
     els.thirdPartyDirection.className = `direction ${decisionTone(externalDirection)}`;
@@ -627,12 +890,47 @@ async function fetchAnalysis(market, signal) {
       candles: market.candles,
       orderBook: market.orderBook,
       fundFlow: market.fundFlow,
-      realtimeTicks: state.realtimeTicks
+      realtimeTicks: state.realtimeTicks,
+      enableThirdPartyAi: thirdPartyEnabled()
     }),
     signal
   });
   if (!response.ok) throw new Error("分析失败");
   return response.json();
+}
+
+function analysisRequestKey(market) {
+  const thirdPartyMode = thirdPartyEnabled() ? "third-on" : "third-off";
+  return `${market.marketType || ""}|${market.symbol || ""}|${els.range.value}|${els.interval.value}|${thirdPartyMode}`;
+}
+
+async function refreshAnalysis(market) {
+  const key = analysisRequestKey(market);
+  if (state.analysisInFlight && state.analysisKey === key) return;
+  if (state.analysisInFlight && state.analysisKey !== key) {
+    state.analysisAbort?.abort();
+  }
+
+  state.analysisKey = key;
+  state.analysisInFlight = true;
+  state.analysisAbort = new AbortController();
+  if (els.engineName) els.engineName.textContent = "本地AI分析中";
+
+  try {
+    const analysis = await fetchAnalysis(market, state.analysisAbort.signal);
+    if (state.analysisKey === key) renderAnalysis(analysis);
+  } catch (error) {
+    if (error.name === "AbortError") return;
+    if (els.openaiNotice) {
+      els.openaiNotice.hidden = false;
+      els.openaiNotice.textContent = `AI判断加载失败：${error.message}`;
+    }
+  } finally {
+    if (state.analysisKey === key) {
+      state.analysisInFlight = false;
+      state.analysisAbort = null;
+    }
+  }
 }
 
 async function refresh() {
@@ -654,8 +952,7 @@ async function refresh() {
     renderBook(market.orderBook, market.currency);
     setStatus("实时刷新", "up");
 
-    const analysis = await fetchAnalysis(market, state.abort.signal);
-    renderAnalysis(analysis);
+    refreshAnalysis(market);
     const portfolio = await fetchPortfolio(state.abort.signal);
     renderPortfolio(portfolio);
   } catch (error) {
@@ -695,6 +992,16 @@ els.portfolioMarket.addEventListener("change", () => {
 
 els.portfolioToggle?.addEventListener("click", () => {
   setPortfolioExpanded(!state.portfolioExpanded);
+});
+
+els.thirdPartyModes?.forEach((item) => {
+  item.addEventListener("change", () => {
+    if (state.market) {
+      state.analysisAbort?.abort();
+      state.analysisInFlight = false;
+      refreshAnalysis(state.market);
+    }
+  });
 });
 
 els.range.addEventListener("change", refresh);

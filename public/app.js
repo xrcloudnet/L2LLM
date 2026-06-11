@@ -45,14 +45,28 @@
   openaiNotice: document.querySelector("#openaiNotice"),
   directionPill: document.querySelector("#directionPill"),
   summaryText: document.querySelector("#summaryText"),
-  thirdPartyEngine: document.querySelector("#thirdPartyEngine"),
   thirdPartyModes: document.querySelectorAll("input[name='thirdPartyMode']"),
-  thirdPartyNotice: document.querySelector("#thirdPartyNotice"),
-  thirdPartyDirection: document.querySelector("#thirdPartyDirection"),
-  thirdPartyConfidence: document.querySelector("#thirdPartyConfidence"),
-  thirdPartySummary: document.querySelector("#thirdPartySummary"),
-  thirdPartyReasons: document.querySelector("#thirdPartyReasons"),
-  thirdPartyRisks: document.querySelector("#thirdPartyRisks"),
+  thirdPartyChartSymbol: document.querySelector("#thirdPartyChartSymbol"),
+  thirdPartyChartEngine: document.querySelector("#thirdPartyChartEngine"),
+  thirdPartyChartNotice: document.querySelector("#thirdPartyChartNotice"),
+  thirdPartyChartDirection: document.querySelector("#thirdPartyChartDirection"),
+  thirdPartyChartConfidence: document.querySelector("#thirdPartyChartConfidence"),
+  thirdPartyChartSummary: document.querySelector("#thirdPartyChartSummary"),
+  thirdPartyChartReasons: document.querySelector("#thirdPartyChartReasons"),
+  thirdPartyChartRisks: document.querySelector("#thirdPartyChartRisks"),
+  thirdPartyMicroSymbol: document.querySelector("#thirdPartyMicroSymbol"),
+  thirdPartyMicroEngine: document.querySelector("#thirdPartyMicroEngine"),
+  thirdPartyMicroNotice: document.querySelector("#thirdPartyMicroNotice"),
+  thirdPartyMicroDirection: document.querySelector("#thirdPartyMicroDirection"),
+  thirdPartyMicroAction: document.querySelector("#thirdPartyMicroAction"),
+  thirdPartyMicroSignal: document.querySelector("#thirdPartyMicroSignal"),
+  thirdPartyMicroOpportunity: document.querySelector("#thirdPartyMicroOpportunity"),
+  thirdPartyMicroIceberg: document.querySelector("#thirdPartyMicroIceberg"),
+  thirdPartyMicroInstitution: document.querySelector("#thirdPartyMicroInstitution"),
+  thirdPartyMicroTrigger: document.querySelector("#thirdPartyMicroTrigger"),
+  thirdPartyMicroSummary: document.querySelector("#thirdPartyMicroSummary"),
+  thirdPartyMicroReasons: document.querySelector("#thirdPartyMicroReasons"),
+  thirdPartyMicroRisks: document.querySelector("#thirdPartyMicroRisks"),
   confidence: document.querySelector("#confidence"),
   rsi: document.querySelector("#rsi"),
   volumeRatio: document.querySelector("#volumeRatio"),
@@ -81,6 +95,11 @@ const state = {
   analysisAbort: null,
   analysisKey: null,
   analysisInFlight: false,
+  thirdPartyRetryTimer: null,
+  thirdPartyRetryKey: null,
+  thirdPartyRetryCount: 0,
+  marketRequestId: 0,
+  requestedSymbol: null,
   market: null,
   realtimeSymbol: null,
   realtimeTicks: [],
@@ -328,11 +347,78 @@ function todayKey(timestamp) {
   return new Date(timestamp).toLocaleDateString();
 }
 
+function isAshareSymbol(symbol) {
+  return /^(SH|SZ)?\d{6}$/.test(symbol) || /^\d{6}\.(SH|SZ)$/.test(symbol);
+}
+
 function resetRealtime(symbol) {
   state.realtimeSymbol = symbol;
   state.realtimeTicks = [];
+  if (els.secondSource) els.secondSource.textContent = "--";
+  if (els.secondPrice) els.secondPrice.textContent = "--";
+  if (els.secondChange) els.secondChange.textContent = "--";
+  if (els.secondCount) els.secondCount.textContent = "0 ticks";
   drawSecondChart();
   drawSecondsMacdChart();
+}
+
+function tickTimestamp(tick) {
+  const parsed = Date.parse(tick.pushedAt || tick.updatedAt || tick.quoteTime);
+  return Number.isFinite(parsed) ? parsed : Date.now();
+}
+
+function toRealtimeTick(tick, fallback = {}) {
+  const price = Number(tick.price);
+  if (!Number.isFinite(price)) return null;
+  return {
+    ...fallback,
+    ...tick,
+    time: tickTimestamp(tick),
+    price
+  };
+}
+
+function mergeRealtimeTicks(ticks) {
+  const normalized = ticks.map((tick) => toRealtimeTick(tick)).filter(Boolean);
+  if (!normalized.length) return false;
+  const latestDay = todayKey(normalized[normalized.length - 1].time);
+  const byKey = new Map();
+  [...state.realtimeTicks, ...normalized].forEach((tick) => {
+    if (todayKey(tick.time) !== latestDay) return;
+    const key = `${tick.quoteTime || ""}|${tick.pushedAt || ""}|${tick.price}|${tick.volume || ""}`;
+    byKey.set(key, tick);
+  });
+  state.realtimeTicks = [...byKey.values()]
+    .sort((left, right) => left.time - right.time)
+    .slice(-7200);
+  return true;
+}
+
+function renderRealtimeLatest(tick, meta = {}) {
+  const nextTick = toRealtimeTick(tick);
+  if (!nextTick) return;
+  const provider = meta.provider || tick.provider || "--";
+  els.secondSource.textContent = provider;
+  els.secondPrice.textContent = money(nextTick.price, tick.currency || state.market?.currency || "");
+  els.secondChange.textContent = `${Number(tick.change) >= 0 ? "+" : ""}${money(Number(tick.change))} (${pct(Number(tick.changePercent))})`;
+  els.secondChange.className = Number(tick.change) >= 0 ? marketColors(state.market || tick).upClass : marketColors(state.market || tick).downClass;
+  const age = Number(meta.latestTickAgeSeconds);
+  const ageText = Number.isFinite(age) ? ` · 最新${age.toFixed(1)}s` : "";
+  els.secondCount.textContent = `${state.realtimeTicks.length} ticks${ageText}`;
+  drawSecondChart();
+  drawSecondsMacdChart();
+}
+
+async function fetchIfindPushTicks(symbol, signal) {
+  const limit = state.realtimeTicks.length ? 300 : 7200;
+  const response = await fetch(`/api/ifind/push/ticks?symbol=${encodeURIComponent(symbol)}&limit=${limit}`, { signal });
+  const payload = await response.json();
+  if (!response.ok) throw new Error(payload.detail || payload.error || "iFinD ticks失败");
+  if (!payload.ticks?.length) return false;
+  const merged = mergeRealtimeTicks(payload.ticks);
+  const latest = payload.ticks[payload.ticks.length - 1];
+  renderRealtimeLatest({ ...(payload.latest || {}), ...latest, currency: "CNY" }, payload);
+  return merged;
 }
 
 function buildRealtimeBars(ticks, intervalMs = 3000) {
@@ -625,16 +711,20 @@ function drawSecondChart() {
 }
 
 async function fetchRealtimeTick() {
-  const symbol = (state.market?.symbol || els.symbol.value).trim().toUpperCase() || "AAPL";
+  const inputSymbol = els.symbol.value.trim().toUpperCase() || "AAPL";
+  const symbol = (state.requestedSymbol || inputSymbol).trim().toUpperCase();
   if (state.realtimeSymbol !== symbol) resetRealtime(symbol);
   state.secondAbort?.abort();
   state.secondAbort = new AbortController();
   try {
+    if (isAshareSymbol(symbol)) {
+      const usedPushTicks = await fetchIfindPushTicks(symbol, state.secondAbort.signal);
+      if (usedPushTicks) return;
+    }
     const response = await fetch(`/api/realtime?symbol=${encodeURIComponent(symbol)}`, { signal: state.secondAbort.signal });
     const tick = await response.json();
     if (!response.ok) throw new Error(tick.detail || tick.error || "秒级行情失败");
-    const parsedTime = Date.parse(tick.pushedAt || tick.updatedAt || tick.quoteTime);
-    const timeValue = Number.isFinite(parsedTime) ? parsedTime : Date.now();
+    const timeValue = tickTimestamp(tick);
     const currentDay = todayKey(timeValue);
     const sameDayTicks = state.realtimeTicks.filter((item) => todayKey(item.time) === currentDay);
     const previous = sameDayTicks[sameDayTicks.length - 1];
@@ -676,7 +766,7 @@ function renderList(target, items) {
   target.innerHTML = "";
   for (const item of items || []) {
     const li = document.createElement("li");
-    li.textContent = item;
+    li.textContent = typeof item === "string" ? item : JSON.stringify(item);
     target.appendChild(li);
   }
 }
@@ -800,6 +890,137 @@ function decisionTone(text = "") {
       : "neutral";
 }
 
+function providerLabel(result, suffix) {
+  const provider = result?.aiProvider || result?.engine;
+  const name = provider === "gemini" ? "Gemini" : provider === "openai" ? "OpenAI / ChatGPT" : "第三方API";
+  const status = result?.aiStatus ? ` · ${result.aiStatus}${result.cached ? " · 缓存" : ""}` : "";
+  return `${name} · ${suffix}${status}`;
+}
+
+function currentSymbolLabel() {
+  const symbol = state.market?.symbol || state.requestedSymbol || els.symbol.value || "--";
+  const name = state.market?.name;
+  return name ? `${symbol} ${name}` : symbol;
+}
+
+function compactReason(reason) {
+  if (!reason) return "";
+  return reason.length > 180 ? `${reason.slice(0, 180)}...` : reason;
+}
+
+function renderThirdPartyBlock(result, config) {
+  if (!config.engine) return;
+  if (config.symbol) config.symbol.textContent = currentSymbolLabel();
+  config.engine.textContent = providerLabel(result, config.label);
+  if (!thirdPartyEnabled() && result?.aiStatus === "disabled" && !result?.cached) {
+    config.direction.textContent = "--";
+    config.direction.className = "direction neutral";
+    if (config.confidence) config.confidence.textContent = "--";
+    if (config.summary) config.summary.textContent = "";
+    if (config.notice) {
+      config.notice.hidden = true;
+      config.notice.textContent = "";
+    }
+    renderList(config.reasons, []);
+    renderList(config.risks, []);
+    return;
+  }
+
+  const direction = result?.direction || result?.signalLabel || result?.action || "--";
+  config.direction.textContent = direction;
+  config.direction.className = `direction ${decisionTone(direction)}`;
+  const confidence = Number(result?.confidence);
+  if (config.confidence) config.confidence.textContent = Number.isFinite(confidence) ? `${confidence}%` : "--";
+  if (config.summary) {
+    config.summary.textContent = result?.summary || result?.signalLabel || result?.action || config.emptyText;
+  }
+  if (config.notice) {
+    if (result?.aiStatus && result.aiStatus !== "ok") {
+      config.notice.hidden = false;
+      config.notice.textContent = compactReason(result.aiReason || result.aiStatus);
+    } else {
+      config.notice.hidden = true;
+      config.notice.textContent = "";
+    }
+  }
+  renderList(config.reasons, result?.reasons?.length ? result.reasons : result?.signalReasons);
+  renderList(config.risks, result?.risks);
+}
+
+function microOpportunityText(result) {
+  const opportunity = result?.opportunity30s;
+  if (!opportunity || typeof opportunity !== "object") return result?.signalLabel || "--";
+  const direction = opportunity.direction || "--";
+  const probabilityValue = Number(opportunity.probability);
+  const probability = Number.isFinite(probabilityValue) ? `${probabilityValue}%` : "--";
+  return `${direction} · ${probability}`;
+}
+
+function microActionText(result) {
+  const score = Number(result?.score);
+  return `${result?.action || "--"} · ${Number.isFinite(score) ? score : "--"}`;
+}
+
+function microSignalText(result) {
+  return result?.signalLabel || result?.direction || "--";
+}
+
+function microIcebergText(result) {
+  const iceberg = result?.icebergOrder;
+  if (!iceberg || typeof iceberg !== "object") return "--";
+  const detected = iceberg.detected ? "发现" : "未见";
+  const side = iceberg.side || "--";
+  const confidenceValue = Number(iceberg.confidence);
+  const confidence = Number.isFinite(confidenceValue) ? `${confidenceValue}%` : "--";
+  return `${detected} · ${side} · ${confidence}`;
+}
+
+function microInstitutionText(result) {
+  const behavior = result?.institutionalBehavior;
+  if (!behavior || typeof behavior !== "object") return typeof behavior === "string" ? behavior : "--";
+  const confidence = Number(behavior.confidence);
+  return `${behavior.classification || "--"} · ${Number.isFinite(confidence) ? `${confidence}%` : "--"}`;
+}
+
+function microTriggerText(result) {
+  const opportunity = result?.opportunity30s;
+  if (!opportunity || typeof opportunity !== "object") return "--";
+  const trigger = opportunity.entryTrigger || "--";
+  const invalidation = opportunity.invalidation || "--";
+  return `${trigger} / ${invalidation}`;
+}
+
+function resetThirdPartyRetry() {
+  clearTimeout(state.thirdPartyRetryTimer);
+  state.thirdPartyRetryTimer = null;
+  state.thirdPartyRetryKey = null;
+  state.thirdPartyRetryCount = 0;
+}
+
+function hasPendingThirdParty(analysis) {
+  const thirdParty = analysis?.thirdParty || analysis?.external || null;
+  return [thirdParty?.chart, thirdParty?.micro, thirdParty].some((item) => item?.aiStatus === "pending");
+}
+
+function scheduleThirdPartyRetry(analysis) {
+  clearTimeout(state.thirdPartyRetryTimer);
+  state.thirdPartyRetryTimer = null;
+  if (!thirdPartyEnabled() || !state.market || !hasPendingThirdParty(analysis)) {
+    resetThirdPartyRetry();
+    return;
+  }
+  const key = thirdPartyRetryKey(state.market);
+  if (state.thirdPartyRetryKey !== key) {
+    state.thirdPartyRetryKey = key;
+    state.thirdPartyRetryCount = 0;
+  }
+  if (state.thirdPartyRetryCount >= 40) return;
+  state.thirdPartyRetryTimer = setTimeout(() => {
+    state.thirdPartyRetryCount += 1;
+    refreshAnalysis(state.market, { retry: true });
+  }, 3000);
+}
+
 function renderAnalysis(analysis) {
   const local = analysis.local || analysis;
   const thirdParty = analysis.thirdParty || analysis.external || null;
@@ -810,7 +1031,7 @@ function renderAnalysis(analysis) {
 
   const aiStatus = thirdParty?.aiStatus || analysis.aiStatus || analysis.openaiStatus;
   const aiReason = thirdParty?.aiReason || analysis.aiReason || analysis.openaiReason;
-  if (aiStatus && aiStatus !== "ok") {
+  if (aiStatus && !["ok", "pending"].includes(aiStatus)) {
     els.openaiNotice.hidden = false;
     els.openaiNotice.textContent = `第三方API未生效：${aiReason || aiStatus}`;
   } else {
@@ -846,35 +1067,39 @@ function renderAnalysis(analysis) {
   renderList(els.reasonList, local.reasons);
   renderList(els.riskList, local.risks);
 
-  if (els.thirdPartyEngine) {
-    const provider = thirdParty?.aiProvider || thirdParty?.engine;
-    els.thirdPartyEngine.textContent = provider === "gemini" ? "Gemini" : provider === "openai" ? "OpenAI / ChatGPT" : "第三方API";
-    if (!thirdPartyEnabled() && thirdParty?.aiStatus === "disabled" && !thirdParty?.cached) {
-      els.thirdPartyDirection.textContent = "--";
-      els.thirdPartyDirection.className = "direction neutral";
-      els.thirdPartyConfidence.textContent = "--";
-      els.thirdPartySummary.textContent = "";
-      els.thirdPartyNotice.hidden = true;
-      els.thirdPartyNotice.textContent = "";
-      renderList(els.thirdPartyReasons, []);
-      renderList(els.thirdPartyRisks, []);
-      return;
-    }
-    const externalDirection = thirdParty?.direction || "--";
-    els.thirdPartyDirection.textContent = externalDirection;
-    els.thirdPartyDirection.className = `direction ${decisionTone(externalDirection)}`;
-    els.thirdPartyConfidence.textContent = thirdParty?.confidence ? `${thirdParty.confidence}%` : "--";
-    els.thirdPartySummary.textContent = thirdParty?.summary || "第三方API未返回独立判断。";
-    if (thirdParty?.aiStatus && thirdParty.aiStatus !== "ok") {
-      els.thirdPartyNotice.hidden = false;
-      els.thirdPartyNotice.textContent = thirdParty.aiReason || thirdParty.aiStatus;
-    } else {
-      els.thirdPartyNotice.hidden = true;
-      els.thirdPartyNotice.textContent = "";
-    }
-    renderList(els.thirdPartyReasons, thirdParty?.reasons);
-    renderList(els.thirdPartyRisks, thirdParty?.risks);
-  }
+  const chartAi = thirdParty?.chart || thirdParty;
+  const microAi = thirdParty?.micro || null;
+  renderThirdPartyBlock(chartAi, {
+    label: "主图K线",
+    emptyText: "第三方主图K线分析未返回独立判断。",
+    symbol: els.thirdPartyChartSymbol,
+    engine: els.thirdPartyChartEngine,
+    notice: els.thirdPartyChartNotice,
+    direction: els.thirdPartyChartDirection,
+    confidence: els.thirdPartyChartConfidence,
+    summary: els.thirdPartyChartSummary,
+    reasons: els.thirdPartyChartReasons,
+    risks: els.thirdPartyChartRisks
+  });
+  renderThirdPartyBlock(microAi, {
+    label: "实时微观结构",
+    emptyText: "第三方微观结构分析未返回独立判断。",
+    symbol: els.thirdPartyMicroSymbol,
+    engine: els.thirdPartyMicroEngine,
+    notice: els.thirdPartyMicroNotice,
+    direction: els.thirdPartyMicroDirection,
+    confidence: null,
+    summary: els.thirdPartyMicroSummary,
+    reasons: els.thirdPartyMicroReasons,
+    risks: els.thirdPartyMicroRisks
+  });
+  if (els.thirdPartyMicroAction) els.thirdPartyMicroAction.textContent = microActionText(microAi);
+  if (els.thirdPartyMicroSignal) els.thirdPartyMicroSignal.textContent = microSignalText(microAi);
+  if (els.thirdPartyMicroOpportunity) els.thirdPartyMicroOpportunity.textContent = microOpportunityText(microAi);
+  if (els.thirdPartyMicroIceberg) els.thirdPartyMicroIceberg.textContent = microIcebergText(microAi);
+  if (els.thirdPartyMicroInstitution) els.thirdPartyMicroInstitution.textContent = microInstitutionText(microAi);
+  if (els.thirdPartyMicroTrigger) els.thirdPartyMicroTrigger.textContent = microTriggerText(microAi);
+  scheduleThirdPartyRetry(analysis);
 }
 
 async function fetchAnalysis(market, signal) {
@@ -891,7 +1116,8 @@ async function fetchAnalysis(market, signal) {
       orderBook: market.orderBook,
       fundFlow: market.fundFlow,
       realtimeTicks: state.realtimeTicks,
-      enableThirdPartyAi: thirdPartyEnabled()
+      enableThirdPartyAi: thirdPartyEnabled(),
+      enableThirdPartySecondsMacdAi: thirdPartyEnabled()
     }),
     signal
   });
@@ -904,8 +1130,21 @@ function analysisRequestKey(market) {
   return `${market.marketType || ""}|${market.symbol || ""}|${els.range.value}|${els.interval.value}|${thirdPartyMode}`;
 }
 
-async function refreshAnalysis(market) {
+function microAnalysisRequestKey(market) {
+  const thirdPartyMode = thirdPartyEnabled() ? "third-on" : "third-off";
+  return `${market.marketType || ""}|${market.symbol || ""}|micro|${thirdPartyMode}`;
+}
+
+function thirdPartyRetryKey(market) {
+  return `${analysisRequestKey(market)}|${microAnalysisRequestKey(market)}`;
+}
+
+async function refreshAnalysis(market, options = {}) {
   const key = analysisRequestKey(market);
+  const retryKey = thirdPartyRetryKey(market);
+  if (!options.retry && state.thirdPartyRetryKey && state.thirdPartyRetryKey !== retryKey) {
+    resetThirdPartyRetry();
+  }
   if (state.analysisInFlight && state.analysisKey === key) return;
   if (state.analysisInFlight && state.analysisKey !== key) {
     state.analysisAbort?.abort();
@@ -936,15 +1175,23 @@ async function refreshAnalysis(market) {
 async function refresh() {
   state.abort?.abort();
   state.abort = new AbortController();
+  const requestId = ++state.marketRequestId;
   const symbol = els.symbol.value.trim().toUpperCase() || "AAPL";
+  state.requestedSymbol = symbol;
   els.symbol.value = symbol;
+  if (state.realtimeSymbol !== symbol) resetRealtime(symbol);
   setStatus("刷新中");
 
   try {
     const url = `/api/market?symbol=${encodeURIComponent(symbol)}&range=${els.range.value}&interval=${els.interval.value}`;
+    const requestStartedAt = performance.now();
+    console.info(`[market] fetch start ${symbol} ${els.range.value}/${els.interval.value}`);
     const response = await fetch(url, { signal: state.abort.signal });
+    const clientElapsed = ((performance.now() - requestStartedAt) / 1000).toFixed(3);
+    console.info(`[market] fetch end ${symbol} status=${response.status} client=${clientElapsed}s server=${response.headers.get("x-process-time") || "--"}s`);
     const market = await response.json();
     if (!response.ok) throw new Error(market.detail || market.error || "行情加载失败");
+    if (requestId !== state.marketRequestId) return;
     state.market = market;
 
     updateQuote(market);
@@ -953,10 +1200,14 @@ async function refresh() {
     setStatus("实时刷新", "up");
 
     refreshAnalysis(market);
-    const portfolio = await fetchPortfolio(state.abort.signal);
-    renderPortfolio(portfolio);
+    fetchPortfolio(state.abort.signal).then(renderPortfolio).catch((error) => {
+      if (error.name === "AbortError") return;
+      setStatus("仓位加载失败", "down");
+      els.providerLine.textContent = error.message;
+    });
   } catch (error) {
     if (error.name === "AbortError") return;
+    if (requestId !== state.marketRequestId) return;
     setStatus("连接异常", "down");
     els.providerLine.textContent = error.message;
   }
@@ -972,6 +1223,13 @@ function schedule() {
 
 els.form.addEventListener("submit", (event) => {
   event.preventDefault();
+  const symbol = els.symbol.value.trim().toUpperCase() || "AAPL";
+  console.info(`[market] submit ${symbol}`);
+  state.requestedSymbol = symbol;
+  resetRealtime(symbol);
+  resetThirdPartyRetry();
+  state.analysisAbort?.abort();
+  state.analysisInFlight = false;
   refresh();
   schedule();
 });
@@ -997,6 +1255,7 @@ els.portfolioToggle?.addEventListener("click", () => {
 els.thirdPartyModes?.forEach((item) => {
   item.addEventListener("change", () => {
     if (state.market) {
+      resetThirdPartyRetry();
       state.analysisAbort?.abort();
       state.analysisInFlight = false;
       refreshAnalysis(state.market);
@@ -1004,8 +1263,12 @@ els.thirdPartyModes?.forEach((item) => {
   });
 });
 
-els.range.addEventListener("change", refresh);
-els.interval.addEventListener("change", refresh);
+els.range.addEventListener("change", () => {
+  refresh();
+});
+els.interval.addEventListener("change", () => {
+  refresh();
+});
 window.addEventListener("resize", () => {
   if (state.market) drawChart(state.market.candles, state.market.quote, state.market);
   drawSecondChart();

@@ -558,7 +558,8 @@ canvas {
   line-height: 1.55;
 }
 
-#thirdPartySummary {
+#thirdPartyChartSummary,
+#thirdPartyMicroSummary {
   color: #d9e2df;
   line-height: 1.55;
 }
@@ -569,9 +570,17 @@ canvas {
   border-top: 1px solid var(--line);
 }
 
+.third-party-ai h4 {
+  margin: 12px 0 8px;
+  color: #ecf3f0;
+  font-size: 13px;
+}
+
 .third-party-engine-line {
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin: -4px 0 8px;
 }
 
@@ -583,6 +592,15 @@ canvas {
   font-size: 12px;
 }
 
+.third-party-engine-line .third-party-symbol {
+  color: #ecf3f0;
+  border-color: rgba(236, 243, 240, 0.18);
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .compact-title {
   margin-bottom: 10px;
 }
@@ -590,6 +608,15 @@ canvas {
 .metrics.third-party-metrics {
   grid-template-columns: 1fr;
   margin: 6px 0 10px;
+}
+
+.metrics.third-party-metrics.micro-metrics {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.micro-metrics dd {
+  overflow-wrap: anywhere;
+  line-height: 1.35;
 }
 
 .metrics {
@@ -661,6 +688,7 @@ li + li {
 
   .quote-grid,
   .metrics,
+  .metrics.third-party-metrics.micro-metrics,
   .portfolio-summary,
   .market-breakdown,
   .portfolio-columns,

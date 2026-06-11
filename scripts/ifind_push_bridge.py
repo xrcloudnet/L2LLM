@@ -64,7 +64,7 @@ async def push_once(symbol: str, ttl: int) -> dict[str, Any]:
     return saved
 
 
-async def run_bridge(symbols: list[str], interval: float, ttl: int, once: bool) -> None:
+async def run_bridge(symbols: list[str], interval: float, ttl: int, once: bool, concurrency: int) -> None:
     normalized = []
     for symbol in symbols:
         symbol_info = normalize_a_share_symbol(symbol)
@@ -72,16 +72,27 @@ async def run_bridge(symbols: list[str], interval: float, ttl: int, once: bool) 
             raise ValueError(f"Only A-share symbols are supported: {symbol}")
         normalized.append(symbol_info["display"])
 
-    while True:
-        for symbol in normalized:
+    semaphore = asyncio.Semaphore(max(1, concurrency))
+
+    async def push_with_limit(symbol: str) -> tuple[str, dict[str, Any] | None, Exception | None]:
+        # Multiple symbols should not wait for each other serially; bound the
+        # concurrency so iFinD is not flooded when the watchlist grows.
+        async with semaphore:
             try:
-                payload = await push_once(symbol, ttl)
+                return symbol, await push_once(symbol, ttl), None
+            except Exception as exc:
+                return symbol, None, exc
+
+    while True:
+        results = await asyncio.gather(*(push_with_limit(symbol) for symbol in normalized))
+        for symbol, payload, error in results:
+            if payload:
                 print(
                     f"{payload['pushedAt']} {payload['symbol']} price={payload['price']} "
                     f"quoteTime={payload.get('quoteTime')} provider={payload.get('provider')}"
                 )
-            except Exception as exc:
-                print(f"{symbol} push failed: {exc}", file=sys.stderr)
+            elif error:
+                print(f"{symbol} push failed: {error}", file=sys.stderr)
         if once:
             return
         await asyncio.sleep(interval)
@@ -92,9 +103,10 @@ def main() -> None:
     parser.add_argument("symbols", nargs="+", help="A-share symbols, e.g. 600519 SH688981 300033.SZ")
     parser.add_argument("--interval", type=float, default=1.0, help="Polling interval in seconds.")
     parser.add_argument("--ttl", type=int, default=6, help="Redis quote TTL in seconds.")
+    parser.add_argument("--concurrency", type=int, default=5, help="Maximum concurrent iFinD quote requests.")
     parser.add_argument("--once", action="store_true", help="Run once and exit.")
     args = parser.parse_args()
-    asyncio.run(run_bridge(args.symbols, args.interval, args.ttl, args.once))
+    asyncio.run(run_bridge(args.symbols, args.interval, args.ttl, args.once, args.concurrency))
 
 
 if __name__ == "__main__":

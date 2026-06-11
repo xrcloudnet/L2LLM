@@ -1,6 +1,6 @@
 # L2LLM 项目函数、功能与 UML 结构说明
 
-更新时间：2026-05-29
+更新时间：2026-06-11
 
 ## 项目概览
 
@@ -329,6 +329,155 @@ L2LLM/
 | `refresh` | 主行情刷新 |
 | `schedule` | 主图 15 秒、实时 quote 1 秒定时 |
 
+## 2026-06-11 第三方 AI 双模块更新
+
+第三方 AI 已从单一复核模块拆分为两个独立分析模块：
+
+| 模块 | 输入 | 缓存 key 维度 | 是否随 K线 range/interval 切换刷新 | 输出重点 |
+|---|---|---|---|---|
+| `thirdParty.chart` | 主图 `candles`、`quote`、当前 `range/interval` | `provider + symbol + range + interval` | 是 | 主图 K线趋势、支撑压力、量价结构、主图交易建议 |
+| `thirdParty.micro` | 独立实时 `realtimeTicks`、`orderBook`、委托流衍生特征 | `provider + symbol` | 否 | 冰山订单、机构微观行为、盘口失衡、未来 30 秒机会 |
+
+当前第三方 AI Redis key 版本为 `v9`：
+
+```text
+chart: l2llm:ai:third_party:v9:chart:{provider}:{symbol}:{range}:{interval}
+micro: l2llm:ai:third_party:v9:micro:{provider}:{symbol}
+```
+
+微观结构分析不再把主图 K线周期作为请求身份的一部分。切换 `1Y/1d`、`1D/1m`、`10Y/1wk` 等主图周期时，只会改变 `chart` 的缓存和刷新；`micro` 继续复用同一股票的实时盘口/委托流分析结果。
+
+### 第三方 AI 双模块数据流
+
+```mermaid
+flowchart TD
+  UI["Frontend AI Panel"] --> Analyze["POST /api/analyze"]
+  Analyze --> Local["run_local_analysis()"]
+  Analyze --> ThirdParty["ai_analysis()"]
+
+  ThirdParty --> ChartOne["ai_analysis_one(type=chart)"]
+  ThirdParty --> MicroOne["ai_analysis_one(type=micro)"]
+
+  ChartOne --> ChartKey["v9 chart key: provider + symbol + range + interval"]
+  MicroOne --> MicroKey["v9 micro key: provider + symbol"]
+
+  ChartKey --> ChartCache{"Redis/Memory hit?"}
+  MicroKey --> MicroCache{"Redis/Memory hit?"}
+
+  ChartCache -->|yes| ChartResult["thirdParty.chart cached"]
+  MicroCache -->|yes| MicroResult["thirdParty.micro cached"]
+
+  ChartCache -->|no| ChartPending["chart pending"]
+  MicroCache -->|no| MicroPending["micro pending"]
+
+  ChartPending --> ChartBg["background OpenAI/Gemini chart request"]
+  MicroPending --> MicroBg["background OpenAI/Gemini micro request"]
+
+  ChartBg --> ChartPayload["compact_chart_payload(): candles + quote + range/interval"]
+  MicroBg --> MicroPayload["compact_micro_payload(): ticks + orderBook + orderFlow"]
+
+  ChartPayload --> Provider["OpenAI Responses / Gemini generateContent"]
+  MicroPayload --> Provider
+
+  Provider --> Parse["parse_ai_json() / recover_partial_ai_json()"]
+  Parse --> Store["cache_set(): Redis + process memory"]
+  Store --> Response["/api/analyze returns local + thirdParty.chart + thirdParty.micro"]
+  Response --> UI
+```
+
+### 前端第三方 AI 渲染结构
+
+```mermaid
+classDiagram
+  class ThirdPartyPanel {
+    +thirdPartyEnabled()
+    +renderAnalysis()
+    +renderThirdPartyBlock()
+    +scheduleThirdPartyRetry()
+  }
+
+  class ChartAIBlock {
+    +thirdPartyChartSymbol
+    +thirdPartyChartEngine
+    +thirdPartyChartDirection
+    +thirdPartyChartConfidence
+    +thirdPartyChartSummary
+    +thirdPartyChartReasons
+    +thirdPartyChartRisks
+  }
+
+  class MicroAIBlock {
+    +thirdPartyMicroSymbol
+    +thirdPartyMicroEngine
+    +thirdPartyMicroDirection
+    +thirdPartyMicroAction
+    +thirdPartyMicroSignal
+    +thirdPartyMicroOpportunity
+    +thirdPartyMicroIceberg
+    +thirdPartyMicroInstitution
+    +thirdPartyMicroTrigger
+    +thirdPartyMicroSummary
+    +thirdPartyMicroReasons
+    +thirdPartyMicroRisks
+  }
+
+  class ThirdPartyStateKeys {
+    +analysisRequestKey(): chart follows range/interval
+    +microAnalysisRequestKey(): micro follows symbol only
+    +thirdPartyRetryKey(): chart key + micro key
+  }
+
+  ThirdPartyPanel --> ChartAIBlock
+  ThirdPartyPanel --> MicroAIBlock
+  ThirdPartyPanel --> ThirdPartyStateKeys
+```
+
+### 微观结构 JSON 输出 Schema
+
+`thirdParty.micro` 要求第三方 AI 返回“简洁但完整”的 JSON：
+
+```json
+{
+  "direction": "偏多/偏空/震荡",
+  "confidence": 0,
+  "summary": "不超过60字",
+  "reasons": ["最多3条"],
+  "risks": ["最多3条"],
+  "action": "BUY/WAIT/SELL/AVOID",
+  "score": 0,
+  "signalLabel": "短标签",
+  "signalReasons": ["最多3条"],
+  "icebergOrder": {
+    "detected": false,
+    "side": "bid/ask/none",
+    "confidence": 0,
+    "evidence": "简短证据"
+  },
+  "institutionalBehavior": {
+    "classification": "机构行为分类",
+    "confidence": 0,
+    "evidence": "简短证据"
+  },
+  "opportunity30s": {
+    "direction": "偏多/偏空/震荡",
+    "probability": 0,
+    "entryTrigger": "入场触发",
+    "invalidation": "失效条件"
+  }
+}
+```
+
+### 第三方 AI 缓存与重试
+
+| 项 | 默认值 | 环境变量 |
+|---|---:|---|
+| chart 请求冷却 | 600 秒（启动脚本） | `THIRD_PARTY_CHART_MIN_INTERVAL` |
+| micro 请求冷却 | 30 秒（启动脚本） | `THIRD_PARTY_MICRO_MIN_INTERVAL` |
+| chart 成功结果展示 TTL | 1800 秒 | `THIRD_PARTY_CHART_CACHE_TTL` |
+| micro 成功结果展示 TTL | 1200 秒（启动脚本） | `THIRD_PARTY_MICRO_CACHE_TTL` |
+| failed/timeout 展示 TTL | 15 秒 | `THIRD_PARTY_ERROR_CACHE_TTL` |
+| failed/timeout 后台重试冷却 | 15 秒 | `THIRD_PARTY_ERROR_RETRY_INTERVAL` |
+
 ## 数据流 UML
 
 ```mermaid
@@ -428,11 +577,21 @@ classDiagram
 
   class ThirdPartyAI {
     +ai_analysis()
+    +ai_analysis_one(type)
+    +third_party_cache_key()
+    +third_party_min_interval()
+    +third_party_cache_ttl()
+    +schedule_third_party_refresh()
     +request_third_party_ai()
     +refresh_third_party_ai_cache()
-    +openai_analysis()
-    +gemini_analysis()
-    +compact_payload()
+    +compact_chart_payload()
+    +compact_micro_payload()
+    +estimate_order_flow()
+    +third_party_prompt()
+    +openai_third_party_analysis()
+    +gemini_third_party_analysis()
+    +parse_ai_json()
+    +recover_partial_ai_json()
     +third_party_unavailable()
   }
 
@@ -504,6 +663,8 @@ classDiagram
     +realtimeTicks
     +analysisInFlight
     +analysisKey
+    +thirdPartyRetryKey
+    +thirdPartyRetryCount
     +portfolioExpanded
   }
 
@@ -524,6 +685,15 @@ classDiagram
     +updateQuote()
     +renderBook()
     +renderAnalysis()
+    +renderThirdPartyBlock()
+    +providerLabel()
+    +currentSymbolLabel()
+    +microActionText()
+    +microSignalText()
+    +microOpportunityText()
+    +microIcebergText()
+    +microInstitutionText()
+    +microTriggerText()
     +renderPortfolio()
     +renderList()
   }
@@ -539,6 +709,11 @@ classDiagram
 
   class Controls {
     +thirdPartyEnabled()
+    +analysisRequestKey()
+    +microAnalysisRequestKey()
+    +thirdPartyRetryKey()
+    +scheduleThirdPartyRetry()
+    +resetThirdPartyRetry()
     +setPortfolioExpanded()
     +schedule()
   }
@@ -575,19 +750,25 @@ sequenceDiagram
   end
 
   UI->>API: POST /api/analyze(enableThirdPartyAi)
-  API->>API: heuristic_analysis()
+  API->>API: run_local_analysis()
   alt Third-party disabled
-    API->>Cache: read third-party cache only
+    API->>Cache: read chart/micro cache only
   else Third-party enabled and cache hit
-    API->>Cache: read third-party cache
+    API->>Cache: read chart cache and micro cache
   else Third-party enabled and cache miss
-    API-->>UI: local AI + thirdParty pending
-    API-)AI: background request
-    AI-->>API: ok / failed / timeout
-    API->>Cache: cache third-party result
+    API-->>UI: local AI + thirdParty.chart/micro pending
+    par Chart analysis
+      API-)AI: background chart request(candles + range/interval)
+      AI-->>API: chart ok / failed / timeout
+      API->>Cache: cache v9 chart provider+symbol+range+interval
+    and Microstructure analysis
+      API-)AI: background micro request(ticks + orderBook + orderFlow)
+      AI-->>API: micro ok / failed / timeout
+      API->>Cache: cache v9 micro provider+symbol
+    end
   end
   API->>DB: save_ai_analysis()
-  API-->>UI: local + thirdParty result
+  API-->>UI: local + thirdParty.chart + thirdParty.micro
 ```
 
 ## 第三方 AI 开关流程
@@ -606,6 +787,35 @@ flowchart TD
   Cached -->|否| Pending["返回 pending + 本地AI"]
   Pending --> Background["后台请求 OpenAI/Gemini"]
   Background --> Store["写入 Redis/内存缓存"]
+```
+
+### 当前版第三方 AI 开关流程
+
+```mermaid
+flowchart TD
+  Toggle["Frontend radio: on/off"] --> Body["POST /api/analyze enableThirdPartyAi"]
+  Body --> Enabled{"enableThirdPartyAi?"}
+  Enabled -->|false| CacheOnly["read chart/micro cache only"]
+  Enabled -->|true| Split["split into chart + micro"]
+
+  Split --> Chart["chart: provider + symbol + range + interval"]
+  Split --> Micro["micro: provider + symbol"]
+
+  Chart --> ChartHit{"chart cache hit?"}
+  Micro --> MicroHit{"micro cache hit?"}
+
+  ChartHit -->|yes| ShowChart["show thirdParty.chart cached"]
+  ChartHit -->|no| ChartPending["show chart pending"]
+  ChartPending --> ChartBg["background chart OpenAI/Gemini"]
+  ChartBg --> StoreChart["cache chart result"]
+
+  MicroHit -->|yes| ShowMicro["show thirdParty.micro cached"]
+  MicroHit -->|no| MicroPending["show micro pending"]
+  MicroPending --> MicroBg["background micro OpenAI/Gemini"]
+  MicroBg --> StoreMicro["cache micro result"]
+
+  CacheOnly --> ReadBoth["read existing chart/micro cache"]
+  ReadBoth --> ShowCache["show cache if present, otherwise empty"]
 ```
 
 ## iFinD Push Snapshot Flow

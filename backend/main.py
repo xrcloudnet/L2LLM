@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import re
 import time
@@ -11,13 +12,20 @@ import akshare as ak
 import httpx
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from backend.cache_store import redis_get, redis_set, redis_status
 from backend.analysis import run_local_analysis
+from backend.analysis.macd import build_seconds_macd_signal
 from backend.db import init_db, list_ai_analysis, list_market_candles, save_ai_analysis, save_market_candles, storage_status
-from backend.ifind_stream import get_ifind_push_quote, get_ifind_push_ticks, ifind_push_enabled, pushed_quote_to_ifind_shape
+from backend.ifind_stream import (
+    get_ifind_push_quote,
+    get_ifind_push_ticks,
+    ifind_push_enabled,
+    parse_time,
+    pushed_quote_to_ifind_shape,
+)
 from backend.providers.common import (
     CHINA_TZ,
     US_TZ,
@@ -34,7 +42,7 @@ from backend.providers.common import (
     resample_candles,
     synthesize_order_book,
 )
-from backend.providers.local_cache import fallback_to_local_market
+from backend.providers.local_cache import fallback_to_local_market, local_cached_market_payload
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,6 +58,25 @@ PORTFOLIO_MARKETS = {
 app = FastAPI(title="L2LLM Stock AI", version="0.2.0")
 cache: dict[str, tuple[float, Any]] = {}
 third_party_ai_pending: set[str] = set()
+request_logger = logging.getLogger("uvicorn.error")
+
+
+@app.middleware("http")
+async def log_request_timing(request: Request, call_next):
+    if not request.url.path.startswith("/api/"):
+        return await call_next(request)
+    started = time.perf_counter()
+    request_logger.info("REQ start %s %s", request.method, request.url.path + (f"?{request.url.query}" if request.url.query else ""))
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed = time.perf_counter() - started
+        request_logger.exception("REQ error %s %s %.3fs", request.method, request.url.path, elapsed)
+        raise
+    elapsed = time.perf_counter() - started
+    response.headers["X-Process-Time"] = f"{elapsed:.3f}"
+    request_logger.info("REQ end %s %s status=%s %.3fs", request.method, request.url.path, response.status_code, elapsed)
+    return response
 
 
 @app.on_event("startup")
@@ -68,16 +95,40 @@ def cache_get(key: str, ttl: float) -> Any | None:
     hit = cache.get(key)
     if not hit:
         return None
-    saved_at, value = hit
-    if time.time() - saved_at > ttl:
+    saved_at = hit[0]
+    value = hit[1]
+    stored_ttl = hit[2] if len(hit) > 2 else ttl
+    if time.time() - saved_at > stored_ttl:
         return None
     return value
 
 
 def cache_set(key: str, value: Any, ttl: float = 30) -> Any:
-    cache[key] = (time.time(), value)
+    cache[key] = (time.time(), value, ttl)
     redis_set(key, value, ttl)
     return value
+
+
+def schedule_market_candle_save(
+    *,
+    market: str,
+    symbol: str,
+    interval: str,
+    provider: str,
+    candles: list[dict[str, Any]],
+) -> None:
+    if not candles:
+        return
+    asyncio.create_task(
+        asyncio.to_thread(
+            save_market_candles,
+            market=market,
+            symbol=symbol,
+            interval=interval,
+            provider=provider,
+            candles=candles,
+        )
+    )
 
 
 
@@ -390,6 +441,10 @@ async def http_json_params(url: str, *, params: dict[str, Any], ttl: float, key:
 
 def ifind_enabled() -> bool:
     return os.getenv("USE_IFIND") == "1"
+
+
+def ifind_realtime_ttl() -> float:
+    return finite(os.getenv("IFIND_REALTIME_TTL")) or 3
 
 
 def ifind_a_share_code(symbol_info: dict[str, str]) -> str:
@@ -792,6 +847,7 @@ async def fetch_ifind_a_share_market(symbol_info: dict[str, str], range_name: st
     if not ifind_enabled():
         raise RuntimeError("USE_IFIND is not 1.")
 
+    phase_started = time.perf_counter()
     pushed_quote = get_ifind_push_quote(symbol_info["display"])
     if pushed_quote:
         quote_data = pushed_quote_to_ifind_shape(pushed_quote)
@@ -801,6 +857,7 @@ async def fetch_ifind_a_share_market(symbol_info: dict[str, str], range_name: st
             ifind_realtime_quote(symbol_info),
             ifind_candles(symbol_info, range_name, interval),
         )
+    request_logger.info("MARKET phase ifind quote+candles %s %.3fs", symbol_info["display"], time.perf_counter() - phase_started)
     if not candles:
         raise RuntimeError("iFinD returned empty K-line data.")
     quote = quote_data["quote"]
@@ -816,6 +873,7 @@ async def fetch_ifind_a_share_market(symbol_info: dict[str, str], range_name: st
     elif interval in {"1wk", "1w", "1week"}:
         candles = merge_realtime_weekly_candle(candles, quote, quote_time)
 
+    phase_started = time.perf_counter()
     try:
         order_book = (await sina_quote(symbol_info))["orderBook"]
         order_book["note"] = f"{order_book.get('note', '')} iFinD行情优先，盘口使用新浪五档兜底。".strip()
@@ -823,10 +881,14 @@ async def fetch_ifind_a_share_market(symbol_info: dict[str, str], range_name: st
         order_book = synthesize_order_book(finite(quote.get("price")), candles)
         order_book["note"] = "iFinD行情优先；盘口源不可用，当前使用估算盘口。"
 
+    request_logger.info("MARKET phase order_book %s %.3fs", symbol_info["display"], time.perf_counter() - phase_started)
+
+    phase_started = time.perf_counter()
     try:
         fund_flow = await a_share_fund_flow(symbol_info)
     except Exception:
         fund_flow = None
+    request_logger.info("MARKET phase fund_flow %s %.3fs", symbol_info["display"], time.perf_counter() - phase_started)
 
     return {
         "symbol": symbol_info["display"],
@@ -1627,90 +1689,177 @@ async def fetch_twelve_data_market(symbol: str, range_name: str, interval: str) 
 # provider adapters, persistence, and third-party AI orchestration.
 
 
-async def ai_analysis_blocking_legacy(payload: dict[str, Any], heuristic: dict[str, Any]) -> dict[str, Any]:
+async def ai_analysis_blocking_legacy(payload: dict[str, Any]) -> dict[str, Any]:
     provider = os.getenv("AI_PROVIDER", "openai").lower()
     timeout = finite(os.getenv("THIRD_PARTY_AI_TIMEOUT")) or 20
     min_interval = finite(os.getenv("THIRD_PARTY_AI_MIN_INTERVAL")) or 300
     symbol = normalize_market_response_symbol(str(payload.get("symbol", "UNKNOWN")))
     range_name = str(payload.get("range") or "")
     interval = str(payload.get("interval") or "")
-    key = f"ai:third_party:v3:{provider}:{symbol}:{range_name}:{interval}"
+    key = f"ai:third_party:v5:seconds_macd:{provider}:{symbol}:{range_name}:{interval}"
 
     cached = cache_get(key, min_interval)
     if cached is not None:
         return {**cached, "cached": True, "aiReason": cached.get("aiReason") or f"第三方API低频缓存，{min_interval:.0f}s 内不重复请求。"}
 
     try:
-        # 第三方AI只做低频补充判断，避免拥塞时每轮行情刷新都打到外部API。
+        # 第三方AI独立做低频技术判断，避免拥塞时每轮行情刷新都打到外部API。
         if provider == "gemini":
-            result = await asyncio.wait_for(gemini_analysis(payload, heuristic), timeout=timeout)
+            result = await asyncio.wait_for(gemini_seconds_macd_analysis(payload), timeout=timeout)
         else:
-            result = await asyncio.wait_for(openai_analysis(payload, heuristic), timeout=timeout)
+            result = await asyncio.wait_for(openai_seconds_macd_analysis(payload), timeout=timeout)
     except asyncio.TimeoutError:
-        result = third_party_unavailable(provider, "timeout", f"第三方API超过 {timeout:.0f}s 未返回，已先展示本地AI判断。")
+        result = third_party_unavailable(provider, "timeout", f"第三方API超过 {timeout:.0f}s 未返回，已先展示本地分析。")
 
     return cache_set(key, result, min_interval)
 
 
-async def request_third_party_ai(provider: str, payload: dict[str, Any], heuristic: dict[str, Any], timeout: float) -> dict[str, Any]:
+async def request_third_party_ai(provider: str, payload: dict[str, Any], timeout: float, analysis_type: str) -> dict[str, Any]:
     try:
-        # Third-party AI is supplementary. Keep it bounded so local AI can stay responsive.
+        # Third-party AI is an independent technical-analysis layer. Keep it bounded so local analysis can stay responsive.
         if provider == "gemini":
-            return await asyncio.wait_for(gemini_analysis(payload, heuristic), timeout=timeout)
-        return await asyncio.wait_for(openai_analysis(payload, heuristic), timeout=timeout)
+            return await asyncio.wait_for(gemini_third_party_analysis(payload, analysis_type), timeout=timeout)
+        return await asyncio.wait_for(openai_third_party_analysis(payload, analysis_type), timeout=timeout)
     except asyncio.TimeoutError:
-        return third_party_unavailable(provider, "timeout", f"第三方API超过 {timeout:.0f}s 未返回，已先展示本地AI判断。")
+        return third_party_unavailable(provider, "timeout", f"第三方API超过 {timeout:.0f}s 未返回，已先展示本地分析。", analysis_type=analysis_type)
 
 
 async def refresh_third_party_ai_cache(
     key: str,
     provider: str,
     payload: dict[str, Any],
-    heuristic: dict[str, Any],
+    analysis_type: str,
     timeout: float,
     min_interval: float,
 ) -> None:
     try:
-        result = await request_third_party_ai(provider, payload, heuristic, timeout)
-        cache_set(key, result, min_interval)
+        try:
+            result = await request_third_party_ai(provider, payload, timeout, analysis_type)
+        except Exception as exc:
+            request_logger.exception("THIRD_PARTY task failed type=%s provider=%s", analysis_type, provider)
+            result = third_party_unavailable(provider, "failed", str(exc), analysis_type=analysis_type)
+        cache_ttl = third_party_cache_ttl(analysis_type, result.get("aiStatus"))
+        result = {**result, "cacheSavedAtEpoch": time.time(), "cacheTtlSeconds": cache_ttl}
+        cache_set(key, result, cache_ttl)
+        request_logger.info(
+            "THIRD_PARTY cached type=%s provider=%s status=%s ttl=%.0fs",
+            analysis_type,
+            provider,
+            result.get("aiStatus"),
+            cache_ttl,
+        )
     finally:
         third_party_ai_pending.discard(key)
 
 
-async def ai_analysis(payload: dict[str, Any], heuristic: dict[str, Any]) -> dict[str, Any]:
+def third_party_min_interval(analysis_type: str) -> float:
+    if analysis_type == "micro":
+        return finite(os.getenv("THIRD_PARTY_MICRO_MIN_INTERVAL")) or 30
+    return finite(os.getenv("THIRD_PARTY_CHART_MIN_INTERVAL")) or finite(os.getenv("THIRD_PARTY_AI_MIN_INTERVAL")) or 300
+
+
+def third_party_cache_ttl(analysis_type: str, status: str | None = None) -> float:
+    if status and status != "ok":
+        return finite(os.getenv("THIRD_PARTY_ERROR_CACHE_TTL")) or 15
+    if analysis_type == "micro":
+        return finite(os.getenv("THIRD_PARTY_MICRO_CACHE_TTL")) or 300
+    return finite(os.getenv("THIRD_PARTY_CHART_CACHE_TTL")) or 1800
+
+
+def third_party_error_retry_interval() -> float:
+    return finite(os.getenv("THIRD_PARTY_ERROR_RETRY_INTERVAL")) or 15
+
+
+def cached_result_age_seconds(result: dict[str, Any]) -> float | None:
+    saved_at = finite(result.get("cacheSavedAtEpoch"))
+    return time.time() - saved_at if saved_at else None
+
+
+def schedule_third_party_refresh(
+    key: str,
+    provider: str,
+    payload: dict[str, Any],
+    analysis_type: str,
+    timeout: float,
+    min_interval: float,
+) -> None:
+    if key in third_party_ai_pending:
+        return
+    third_party_ai_pending.add(key)
+    payload_copy = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
+    asyncio.create_task(refresh_third_party_ai_cache(key, provider, payload_copy, analysis_type, timeout, min_interval))
+
+
+def third_party_cache_key(provider: str, analysis_type: str, symbol: str, range_name: str, interval: str) -> str:
+    # Chart analysis is tied to the visible main chart period. Microstructure
+    # analysis is tied to the symbol's realtime ticks/order book only, so chart
+    # interval switches must not create a new third-party micro request.
+    if analysis_type == "micro":
+        return f"ai:third_party:v9:{analysis_type}:{provider}:{symbol}"
+    return f"ai:third_party:v9:{analysis_type}:{provider}:{symbol}:{range_name}:{interval}"
+
+
+async def ai_analysis_one(payload: dict[str, Any], analysis_type: str) -> dict[str, Any]:
     provider = os.getenv("AI_PROVIDER", "openai").lower()
     timeout = finite(os.getenv("THIRD_PARTY_AI_TIMEOUT")) or 20
-    min_interval = finite(os.getenv("THIRD_PARTY_AI_MIN_INTERVAL")) or 300
+    min_interval = third_party_min_interval(analysis_type)
     symbol = normalize_market_response_symbol(str(payload.get("symbol", "UNKNOWN")))
     range_name = str(payload.get("range") or "")
     interval = str(payload.get("interval") or "")
-    key = f"ai:third_party:v3:{provider}:{symbol}:{range_name}:{interval}"
+    key = third_party_cache_key(provider, analysis_type, symbol, range_name, interval)
 
-    cached = cache_get(key, min_interval)
+    cached = cache_get(key, third_party_cache_ttl(analysis_type))
     if cached is not None:
+        if (
+            payload.get("enableThirdPartyAi") is not False
+            and cached.get("aiStatus") not in {None, "ok", "pending"}
+            and (cached_result_age_seconds(cached) is None or cached_result_age_seconds(cached) >= third_party_error_retry_interval())
+        ):
+            # Failed/timeout cache is only a short-lived display fallback. Keep
+            # retrying in the background after a small cooldown so the UI can
+            # recover without the user toggling the switch.
+            schedule_third_party_refresh(key, provider, payload, analysis_type, timeout, min_interval)
         return {**cached, "cached": True, "aiReason": cached.get("aiReason") or f"第三方API低频缓存，{min_interval:.0f}s 内不重复请求。"}
 
     if payload.get("enableThirdPartyAi") is False:
-        return third_party_unavailable(provider, "disabled", "第三方AI开关已关闭，且当前标的暂无缓存结果。")
+        return third_party_unavailable(provider, "disabled", "第三方AI开关已关闭，且当前标的暂无缓存结果。", analysis_type=analysis_type)
 
-    if key not in third_party_ai_pending:
-        third_party_ai_pending.add(key)
-        payload_copy = json.loads(json.dumps(payload, ensure_ascii=False, default=str))
-        heuristic_copy = json.loads(json.dumps(heuristic, ensure_ascii=False, default=str))
-        asyncio.create_task(refresh_third_party_ai_cache(key, provider, payload_copy, heuristic_copy, timeout, min_interval))
+    schedule_third_party_refresh(key, provider, payload, analysis_type, timeout, min_interval)
 
-    return third_party_unavailable(provider, "pending", "第三方AI已转入后台低频请求，本地AI判断先返回；结果会在后续刷新中显示。")
+    return third_party_unavailable(provider, "pending", "第三方AI已转入后台低频请求，本地分析先返回；结果会在后续刷新中显示。", analysis_type=analysis_type)
 
 
-def third_party_unavailable(provider: str, status: str, reason: str, request_id: str | None = None) -> dict[str, Any]:
+async def ai_analysis(payload: dict[str, Any], heuristic: dict[str, Any] | None = None) -> dict[str, Any]:
+    chart, micro = await asyncio.gather(
+        ai_analysis_one(payload, "chart"),
+        ai_analysis_one(payload, "micro"),
+    )
+    return {
+        "chart": chart,
+        "micro": micro,
+        "aiProvider": chart.get("aiProvider") or micro.get("aiProvider"),
+        "aiStatus": "ok" if chart.get("aiStatus") == "ok" or micro.get("aiStatus") == "ok" else chart.get("aiStatus") or micro.get("aiStatus"),
+        "aiReason": "; ".join(filter(None, [chart.get("aiReason"), micro.get("aiReason")]))[:300],
+    }
+
+
+def third_party_unavailable(provider: str, status: str, reason: str, request_id: str | None = None, analysis_type: str = "unknown") -> dict[str, Any]:
     result = {
         "engine": provider,
         "aiProvider": provider,
         "aiStatus": status,
         "aiReason": reason,
         "available": False,
+        "analysisType": analysis_type,
         "direction": None,
         "confidence": None,
+        "action": None,
+        "score": None,
+        "signalLabel": None,
+        "signalReasons": [],
+        "opportunity30s": None,
+        "icebergOrder": None,
+        "institutionalBehavior": None,
         "summary": "",
         "reasons": [],
         "risks": [],
@@ -1723,60 +1872,246 @@ def third_party_unavailable(provider: str, status: str, reason: str, request_id:
     return result
 
 
-def compact_payload(payload: dict[str, Any], heuristic: dict[str, Any]) -> dict[str, Any]:
+def parse_ai_json(text: str | None) -> dict[str, Any]:
+    if not text:
+        raise ValueError("第三方AI没有返回文本内容。")
+    source = text.strip()
+    if source.startswith("```"):
+        source = re.sub(r"^```(?:json)?\s*", "", source, flags=re.IGNORECASE).strip()
+        source = re.sub(r"\s*```$", "", source).strip()
+    start = source.find("{")
+    end = source.rfind("}")
+    if start >= 0 and end > start:
+        source = source[start : end + 1]
+    try:
+        parsed = json.loads(source)
+    except json.JSONDecodeError as exc:
+        preview = source[:240].replace("\n", " ")
+        recovered = recover_partial_ai_json(source)
+        if recovered:
+            return {
+                **recovered,
+                "_parseWarning": f"第三方AI返回JSON不完整，已提取可用字段：{exc.msg}。片段：{preview}",
+            }
+        raise ValueError(f"第三方AI返回内容不是完整JSON：{exc.msg}。片段：{preview}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError("第三方AI JSON 顶层不是对象。")
+    return parsed
+
+
+def recover_partial_ai_json(source: str) -> dict[str, Any] | None:
+    # API congestion can truncate a JSON response after it already contains the
+    # key decision fields. Recover those fields so the UI can show the useful
+    # judgment instead of only "failed".
+    def field_text(name: str) -> str | None:
+        match = re.search(rf'"{re.escape(name)}"\s*:\s*"((?:\\.|[^"\\])*)"', source, re.S)
+        if not match:
+            return None
+        return match.group(1).replace('\\"', '"').replace("\\n", "\n")
+
+    def field_number(name: str) -> float | None:
+        match = re.search(rf'"{re.escape(name)}"\s*:\s*(-?\d+(?:\.\d+)?)', source)
+        return finite(match.group(1)) if match else None
+
+    def array_text(name: str) -> list[str]:
+        match = re.search(rf'"{re.escape(name)}"\s*:\s*\[(.*?)\]', source, re.S)
+        if not match:
+            return []
+        return re.findall(r'"((?:\\.|[^"\\])*)"', match.group(1))[:3]
+
+    direction = field_text("direction")
+    summary = field_text("summary")
+    action = field_text("action")
+    signal_label = field_text("signalLabel")
+    if not any([direction, summary, action, signal_label]):
+        return None
+    confidence = field_number("confidence")
+    if confidence is not None and 0 <= confidence <= 1:
+        confidence *= 100
+    score = field_number("score")
+    return {
+        "direction": direction,
+        "confidence": int(round(confidence)) if confidence is not None else None,
+        "summary": summary or signal_label or action or "",
+        "reasons": array_text("reasons") or array_text("signalReasons"),
+        "risks": array_text("risks"),
+        "action": action,
+        "score": int(round(score)) if score is not None else None,
+        "signalLabel": signal_label,
+        "signalReasons": array_text("signalReasons"),
+        "icebergOrder": {
+            "detected": False,
+            "side": "none",
+            "confidence": 0,
+            "evidence": "JSON截断，未提取到完整冰山字段",
+        },
+        "institutionalBehavior": {
+            "classification": "未知",
+            "confidence": 0,
+            "evidence": "JSON截断，未提取到完整机构行为字段",
+        },
+        "opportunity30s": {
+            "direction": direction or "震荡",
+            "probability": int(round(confidence)) if confidence is not None else 0,
+            "entryTrigger": "等待完整信号",
+            "invalidation": "等待完整信号",
+        },
+    }
+
+
+def compact_seconds_macd_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    realtime_ticks = payload.get("realtimeTicks") or []
+    quote = payload.get("quote") or {}
+    technical_snapshot: dict[str, Any] = {}
+    if realtime_ticks:
+        technical_snapshot = (build_seconds_macd_signal(realtime_ticks, quote) or {}).get("metrics") or {}
+
     return {
         "symbol": payload.get("symbol"),
+        "marketType": payload.get("marketType"),
         "quote": payload.get("quote"),
         "orderBook": {
             "imbalance": (payload.get("orderBook") or {}).get("imbalance"),
             "provider": (payload.get("orderBook") or {}).get("provider"),
         },
-        "fundFlow": payload.get("fundFlow"),
         "recentCandles": (payload.get("candles") or [])[-24:],
-        "heuristic": {
-            "direction": heuristic.get("direction"),
-            "confidence": heuristic.get("confidence"),
-            "summary": heuristic.get("summary"),
-            "metrics": heuristic.get("metrics"),
-                "signals": heuristic.get("signals"),
-            "kline": heuristic.get("kline"),
-            "reasons": heuristic.get("reasons"),
-            "risks": heuristic.get("risks"),
+        "realtimeTicks": realtime_ticks[-80:],
+        "technicalSnapshot": technical_snapshot,
+        "indicatorHints": {
+            "mainChartCandleCount": len(payload.get("candles") or []),
+            "realtimeTickCount": len(realtime_ticks),
         },
     }
 
 
-async def openai_analysis(payload: dict[str, Any], heuristic: dict[str, Any]) -> dict[str, Any]:
+def compact_chart_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    candles = payload.get("candles") or []
+    return {
+        "symbol": payload.get("symbol"),
+        "marketType": payload.get("marketType"),
+        "range": payload.get("range"),
+        "interval": payload.get("interval"),
+        "quote": payload.get("quote"),
+        "recentCandles": candles[-120:],
+        "indicatorHints": {
+            "candleCount": len(candles),
+            "range": payload.get("range"),
+            "interval": payload.get("interval"),
+        },
+    }
+
+
+def estimate_order_flow(realtime_ticks: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = []
+    previous_price = None
+    previous_volume = None
+    buy_volume = 0.0
+    sell_volume = 0.0
+    neutral_volume = 0.0
+    for tick in realtime_ticks[-240:]:
+        price = finite(tick.get("price"))
+        volume = finite(tick.get("volume"))
+        if price is None:
+            continue
+        delta_volume = 0.0
+        if volume is not None and previous_volume is not None:
+            delta_volume = max(0.0, volume - previous_volume)
+        direction = "neutral"
+        if previous_price is not None:
+            if price > previous_price:
+                direction = "buy"
+                buy_volume += delta_volume
+            elif price < previous_price:
+                direction = "sell"
+                sell_volume += delta_volume
+            else:
+                neutral_volume += delta_volume
+        rows.append({
+            "time": tick.get("quoteTime") or tick.get("pushedAt") or tick.get("updatedAt"),
+            "price": price,
+            "volumeDelta": delta_volume,
+            "direction": direction,
+        })
+        previous_price = price
+        if volume is not None:
+            previous_volume = volume
+    total = buy_volume + sell_volume + neutral_volume
+    return {
+        "recentTrades": rows[-80:],
+        "buyVolume": buy_volume,
+        "sellVolume": sell_volume,
+        "neutralVolume": neutral_volume,
+        "orderFlowImbalance": (buy_volume - sell_volume) / total if total else None,
+        "largePrintThreshold": max([row["volumeDelta"] for row in rows], default=0) * 0.7 if rows else None,
+    }
+
+
+def compact_micro_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    realtime_ticks = payload.get("realtimeTicks") or []
+    order_book = payload.get("orderBook") or {}
+    return {
+        "symbol": payload.get("symbol"),
+        "marketType": payload.get("marketType"),
+        "quote": payload.get("quote"),
+        "orderBook": {
+            "provider": order_book.get("provider"),
+            "imbalance": order_book.get("imbalance"),
+            "bids": (order_book.get("bids") or [])[:10],
+            "asks": (order_book.get("asks") or [])[:10],
+        },
+        "realtimeTicks": realtime_ticks[-160:],
+        "orderFlow": estimate_order_flow(realtime_ticks),
+        "task": "Identify iceberg orders, institutional microstructure behavior, liquidity absorption, spoofing/trap risk, and 30s opportunity.",
+    }
+
+
+def third_party_prompt(analysis_type: str, payload: dict[str, Any]) -> tuple[str, str, dict[str, Any]]:
+    if analysis_type == "chart":
+        compact = compact_chart_payload(payload)
+        return (
+            "你是主图K线分析助手。你只分析主图 candles，对当前 range/interval 的趋势、支撑压力、MACD/量价/K线结构做判断。必须强调不构成投资建议。输出JSON。",
+            "请基于主图K线独立判断，返回字段：direction, confidence, summary, reasons, risks, action, score, signalLabel, signalReasons。direction只能是偏多/偏空/震荡；action只能是 BUY/WAIT/SELL；summary不超过100字；reasons和risks最多3条。",
+            compact,
+        )
+    compact = compact_micro_payload(payload)
+    return (
+        "你是市场微观结构分析助手。只分析实时ticks、盘口orderbook和委托流衍生特征，识别冰山订单、机构吸收/压单/撤单诱导、短线流动性失衡，并预测未来30秒交易机会。只输出短JSON，不写长段落。",
+        (
+            "返回严格JSON，字段必须完整且不得省略："
+            "direction, confidence, summary, reasons, risks, action, score, signalLabel, signalReasons, "
+            "icebergOrder, institutionalBehavior, opportunity30s。"
+            "direction只能是偏多/偏空/震荡；confidence和score为0-100整数；"
+            "summary不超过60字；reasons/risks/signalReasons各3条以内且每条20字以内；"
+            "action只能是 BUY/WAIT/SELL/AVOID；signalLabel用2-6字短标签。"
+            "icebergOrder必须是{detected:boolean, side:string, confidence:number, evidence:string}，side只能是bid/ask/none。"
+            "institutionalBehavior必须是{classification:string, confidence:number, evidence:string}。"
+            "opportunity30s必须是{direction:string, probability:number, entryTrigger:string, invalidation:string}。"
+            "所有 evidence/trigger/invalidation 保持简洁但具体。"
+        ),
+        compact,
+    )
+
+
+async def openai_third_party_analysis(payload: dict[str, Any], analysis_type: str) -> dict[str, Any]:
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        return third_party_unavailable("openai", "disabled", "OPENAI_API_KEY is not visible to FastAPI.")
+        return third_party_unavailable("openai", "disabled", "OPENAI_API_KEY is not visible to FastAPI.", analysis_type=analysis_type)
     if os.getenv("USE_OPENAI", "1") != "1":
-        return third_party_unavailable("openai", "disabled", "USE_OPENAI must be 1.")
+        return third_party_unavailable("openai", "disabled", "USE_OPENAI must be 1.", analysis_type=analysis_type)
 
+    system_prompt, user_prompt, compact_payload = third_party_prompt(analysis_type, payload)
     body = {
         "model": os.getenv("OPENAI_MODEL", "gpt-5-mini"),
-        "max_output_tokens": int(finite(os.getenv("OPENAI_MAX_OUTPUT_TOKENS")) or 1000),
+        "max_output_tokens": int(finite(os.getenv("OPENAI_MAX_OUTPUT_TOKENS")) or 2400),
         "input": [
-            {"role": "system", "content": "你是股票行情研究助手。基于报价、盘口和K线指标给出短线行情解读。必须强调不构成投资建议。输出JSON。"},
-            {"role": "user", "content": f"请分析以下行情数据，返回字段：direction, confidence, summary, reasons, risks, metrics, signals, kline。signals 必须包含 mainAccumulation, hotMoneyIgnition, mainChartMacd, secondsMacd, wyckoff, ddeFlow, bullTrap, limitUpProbability, riskLevel，每项包含 score, label, reasons。mainChartMacd 基于主图 candles，secondsMacd 基于独立当日秒级/分时数据，wyckoff 包含阶段A-E、事件和买卖信号。kline 必须包含 trend, patterns, supportResistance, summary。\n{json.dumps(compact_payload(payload, heuristic), ensure_ascii=False)}"},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"{user_prompt}\n{json.dumps(compact_payload, ensure_ascii=False)}"},
         ],
         "text": {"format": {"type": "json_object"}},
     }
     reasoning_effort = os.getenv("OPENAI_REASONING_EFFORT", "").strip()
     if reasoning_effort:
         body["reasoning"] = {"effort": reasoning_effort}
-    body["input"] = [
-        {"role": "system", "content": "你是股票行情研究助手。只输出简短 JSON，不构成投资建议。"},
-        {
-            "role": "user",
-            "content": (
-                "基于以下本地AI结果做复核，返回严格JSON，只包含 direction, confidence, summary, reasons, risks。"
-                "direction只能是偏多/偏空/震荡；confidence为0-100整数；summary不超过80字；"
-                "reasons最多3条，每条不超过30字；risks最多3条，每条不超过30字。\n"
-                f"{json.dumps(compact_payload(payload, heuristic), ensure_ascii=False)}"
-            ),
-        },
-    ]
     try:
         request_timeout = finite(os.getenv("THIRD_PARTY_AI_TIMEOUT")) or 20
         timeout_config = httpx.Timeout(request_timeout, connect=3.0, read=request_timeout, write=3.0, pool=3.0)
@@ -1789,7 +2124,7 @@ async def openai_analysis(payload: dict[str, Any], heuristic: dict[str, Any]) ->
         request_id = response.headers.get("x-request-id")
         if response.status_code >= 400:
             error = response.json().get("error", {}).get("message", response.text)
-            return third_party_unavailable("openai", "failed", error, request_id)
+            return third_party_unavailable("openai", "failed", error, request_id, analysis_type=analysis_type)
         data = response.json()
         text = data.get("output_text")
         if not text:
@@ -1798,27 +2133,34 @@ async def openai_analysis(payload: dict[str, Any], heuristic: dict[str, Any]) ->
                     if part.get("type") == "output_text":
                         text = part.get("text")
                         break
-        parsed = json.loads(text)
-        return {**parsed, "engine": "openai", "aiStatus": "ok", "aiProvider": "openai", "aiRequestId": request_id, "available": True}
+        parsed = parse_ai_json(text)
+        parse_warning = parsed.pop("_parseWarning", None)
+        return {
+            **parsed,
+            "engine": "openai",
+            "aiStatus": "ok",
+            "aiProvider": "openai",
+            "aiReason": parse_warning,
+            "aiRequestId": request_id,
+            "available": True,
+            "analysisType": analysis_type,
+        }
     except Exception as exc:
-        return third_party_unavailable("openai", "failed", str(exc))
+        return third_party_unavailable("openai", "failed", str(exc), analysis_type=analysis_type)
 
 
-async def gemini_analysis(payload: dict[str, Any], heuristic: dict[str, Any]) -> dict[str, Any]:
+async def openai_seconds_macd_analysis(payload: dict[str, Any]) -> dict[str, Any]:
+    return await openai_third_party_analysis(payload, "micro")
+
+
+async def gemini_third_party_analysis(payload: dict[str, Any], analysis_type: str) -> dict[str, Any]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
-        return third_party_unavailable("gemini", "disabled", "GEMINI_API_KEY is not visible to FastAPI.")
+        return third_party_unavailable("gemini", "disabled", "GEMINI_API_KEY is not visible to FastAPI.", analysis_type=analysis_type)
 
     model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-    prompt = (
-        "你是股票行情研究助手。基于报价、盘口和K线指标给出短线行情解读。"
-        "返回严格JSON，字段：direction, confidence, summary, reasons, risks, metrics, signals, kline。"
-        "signals 必须包含 mainAccumulation, hotMoneyIgnition, mainChartMacd, secondsMacd, wyckoff, ddeFlow, bullTrap, limitUpProbability, riskLevel，每项包含 score, label, reasons。"
-        "mainChartMacd 基于主图 candles，secondsMacd 基于独立当日秒级/分时数据。"
-        "kline 必须包含 trend, patterns, supportResistance, summary。"
-        "必须强调不构成投资建议。\n"
-        f"{json.dumps(compact_payload(payload, heuristic), ensure_ascii=False)}"
-    )
+    system_prompt, user_prompt, compact_payload = third_party_prompt(analysis_type, payload)
+    prompt = f"{system_prompt}\n{user_prompt}\n{json.dumps(compact_payload, ensure_ascii=False)}"
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
@@ -1831,13 +2173,26 @@ async def gemini_analysis(payload: dict[str, Any], heuristic: dict[str, Any]) ->
             )
         if response.status_code >= 400:
             error = response.json().get("error", {}).get("message", response.text)
-            return third_party_unavailable("gemini", "failed", error)
+            return third_party_unavailable("gemini", "failed", error, analysis_type=analysis_type)
         data = response.json()
         text = data["candidates"][0]["content"]["parts"][0]["text"]
-        parsed = json.loads(text)
-        return {**parsed, "engine": "gemini", "aiStatus": "ok", "aiProvider": "gemini", "available": True}
+        parsed = parse_ai_json(text)
+        parse_warning = parsed.pop("_parseWarning", None)
+        return {
+            **parsed,
+            "engine": "gemini",
+            "aiStatus": "ok",
+            "aiProvider": "gemini",
+            "aiReason": parse_warning,
+            "available": True,
+            "analysisType": analysis_type,
+        }
     except Exception as exc:
-        return third_party_unavailable("gemini", "failed", str(exc))
+        return third_party_unavailable("gemini", "failed", str(exc), analysis_type=analysis_type)
+
+
+async def gemini_seconds_macd_analysis(payload: dict[str, Any]) -> dict[str, Any]:
+    return await gemini_third_party_analysis(payload, "micro")
 
 
 @app.get("/api/health")
@@ -1935,8 +2290,7 @@ async def market(symbol: str = "600519", range: str = "1d", interval: str = "1m"
                 reason=str(exc),
             )
         if not payload.get("cached"):
-            await asyncio.to_thread(
-                save_market_candles,
+            schedule_market_candle_save(
                 market=payload.get("marketType") or "cn",
                 symbol=payload.get("symbol") or a_share["display"],
                 interval=interval,
@@ -1975,8 +2329,7 @@ async def market(symbol: str = "600519", range: str = "1d", interval: str = "1m"
                     reason=f"Moomoo failed: {moomoo_exc}; Yahoo failed: {yahoo_exc}; Twelve Data failed: {twelve_exc}",
                 )
     if not payload.get("cached"):
-        await asyncio.to_thread(
-            save_market_candles,
+        schedule_market_candle_save(
             market=payload.get("marketType") or normalize_portfolio_market(None, symbol),
             symbol=payload.get("symbol") or symbol.upper(),
             interval=interval,
@@ -2011,7 +2364,7 @@ async def realtime_quote(symbol: str = "600519"):
                     "amount": finite(pushed_quote.get("amount")),
                 }
         try:
-            data = await ifind_realtime_quote(a_share, ttl=1)
+            data = await ifind_realtime_quote(a_share, ttl=ifind_realtime_ttl())
             quote = data.get("quote") or {}
             price = finite(quote.get("price"))
             if price is None:
@@ -2031,25 +2384,52 @@ async def realtime_quote(symbol: str = "600519"):
                 "amount": finite(quote.get("amount")),
             }
         except Exception as ifind_exc:
-            data = await sina_quote(a_share)
-            quote = data.get("quote") or {}
-            price = finite(quote.get("price"))
-            if price is None:
-                raise HTTPException(status_code=502, detail=f"realtime quote unavailable: {ifind_exc}")
-            return {
-                "symbol": a_share["display"],
-                "name": data.get("name") or a_share["display"],
-                "marketType": "cn",
-                "currency": "CNY",
-                "provider": f"Sina realtime fallback (iFinD: {ifind_exc})",
-                "quoteTime": data.get("quoteTime"),
-                "updatedAt": now_iso(),
-                "price": price,
-                "change": finite(quote.get("change")),
-                "changePercent": finite(quote.get("changePercent")),
-                "volume": finite(quote.get("volume")),
-                "amount": finite(quote.get("amount")),
-            }
+            try:
+                data = await sina_quote(a_share)
+                quote = data.get("quote") or {}
+                price = finite(quote.get("price"))
+                if price is None:
+                    raise RuntimeError("Sina realtime quote has no price")
+                return {
+                    "symbol": a_share["display"],
+                    "name": data.get("name") or a_share["display"],
+                    "marketType": "cn",
+                    "currency": "CNY",
+                    "provider": f"Sina realtime fallback (iFinD: {ifind_exc})",
+                    "quoteTime": data.get("quoteTime"),
+                    "updatedAt": now_iso(),
+                    "price": price,
+                    "change": finite(quote.get("change")),
+                    "changePercent": finite(quote.get("changePercent")),
+                    "volume": finite(quote.get("volume")),
+                    "amount": finite(quote.get("amount")),
+                }
+            except Exception as sina_exc:
+                cached = await local_cached_market_payload(
+                    market="cn",
+                    symbol=a_share["display"],
+                    range_name="1d",
+                    interval="1d",
+                    reason=f"iFinD realtime failed: {ifind_exc}; Sina realtime failed: {sina_exc}",
+                )
+                if cached:
+                    quote = cached.get("quote") or {}
+                    return {
+                        "symbol": cached.get("symbol") or a_share["display"],
+                        "name": cached.get("name") or a_share["display"],
+                        "marketType": "cn",
+                        "currency": "CNY",
+                        "provider": cached.get("provider") or "Local SQLite realtime cache",
+                        "quoteTime": cached.get("quoteTime"),
+                        "updatedAt": now_iso(),
+                        "cached": True,
+                        "price": finite(quote.get("price")),
+                        "change": finite(quote.get("change")),
+                        "changePercent": finite(quote.get("changePercent")),
+                        "volume": finite(quote.get("volume")),
+                        "amount": finite(quote.get("amount")),
+                    }
+                raise HTTPException(status_code=502, detail=f"realtime quote unavailable: {ifind_exc}; {sina_exc}")
 
     normalized_symbol = symbol.strip().upper()
     if re.match(r"^\d{1,5}$", normalized_symbol):
@@ -2079,6 +2459,31 @@ async def realtime_quote(symbol: str = "600519"):
             "amount": finite(snapshot.get("turnover")),
         }
     except Exception as exc:
+        market_type = normalize_portfolio_market(None, normalized_symbol)
+        cached = await local_cached_market_payload(
+            market=market_type,
+            symbol=normalize_market_response_symbol(normalized_symbol),
+            range_name="1d",
+            interval="1d",
+            reason=f"Moomoo realtime failed: {exc}",
+        )
+        if cached:
+            quote = cached.get("quote") or {}
+            return {
+                "symbol": cached.get("symbol") or normalized_symbol,
+                "name": cached.get("name") or normalized_symbol,
+                "marketType": cached.get("marketType") or market_type,
+                "currency": cached.get("currency"),
+                "provider": cached.get("provider") or "Local SQLite realtime cache",
+                "quoteTime": cached.get("quoteTime"),
+                "updatedAt": now_iso(),
+                "cached": True,
+                "price": finite(quote.get("price")),
+                "change": finite(quote.get("change")),
+                "changePercent": finite(quote.get("changePercent")),
+                "volume": finite(quote.get("volume")),
+                "amount": finite(quote.get("amount")),
+            }
         raise HTTPException(status_code=502, detail=f"realtime quote unavailable: {exc}") from exc
 
 
@@ -2089,11 +2494,22 @@ async def ifind_push_ticks(symbol: str = "600519", limit: int = 200):
         raise HTTPException(status_code=400, detail="Only A-share symbols are supported")
     ticks = get_ifind_push_ticks(a_share["display"], limit=limit)
     latest = get_ifind_push_quote(a_share["display"])
+    latest_tick = ticks[-1] if ticks else None
+    latest_pushed_at = parse_time(latest_tick.get("pushedAt")) if latest_tick else None
+    latest_age = (
+        (datetime.now(timezone.utc) - latest_pushed_at.astimezone(timezone.utc)).total_seconds()
+        if latest_pushed_at
+        else None
+    )
     return {
         "symbol": a_share["display"],
         "enabled": ifind_push_enabled(),
         "count": len(ticks),
         "latest": latest,
+        "latestTickAgeSeconds": finite(latest_age),
+        "oldestTickTime": ticks[0].get("quoteTime") if ticks else None,
+        "newestTickTime": latest_tick.get("quoteTime") if latest_tick else None,
+        "provider": latest_tick.get("provider") if latest_tick else "iFinD Push",
         "ticks": ticks,
     }
 
@@ -2165,6 +2581,11 @@ async def history_analysis(market: str | None = None, symbol: str | None = None,
             limit=limit,
         )
     }
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return Response(status_code=204)
 
 
 @app.exception_handler(Exception)

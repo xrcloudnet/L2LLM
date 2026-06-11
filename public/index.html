@@ -220,7 +220,7 @@
             </div>
             <div class="third-party-ai">
               <div class="panel-title compact-title">
-                <h3>第三方API判断</h3>
+                <h3>第三方AI分析</h3>
                 <div class="ai-segment" title="关闭后不请求 OpenAI/Gemini">
                   <label>
                     <input name="thirdPartyMode" type="radio" value="on" checked>
@@ -232,21 +232,51 @@
                   </label>
                 </div>
               </div>
-              <div class="third-party-engine-line"><span id="thirdPartyEngine">--</span></div>
-              <div id="thirdPartyNotice" class="openai-notice" hidden></div>
-              <div id="thirdPartyDirection" class="direction neutral">--</div>
+              <h4>主图K线分析</h4>
+              <div class="third-party-engine-line">
+                <span id="thirdPartyChartSymbol" /*class="third-party-symbol">*/--</span>
+                <span id="thirdPartyChartEngine">--</span>
+              </div>
+              <div id="thirdPartyChartNotice" class="openai-notice" hidden></div>
+              <div id="thirdPartyChartDirection" class="direction neutral">--</div>
               <dl class="metrics third-party-metrics">
-                <div><dt>置信度</dt><dd id="thirdPartyConfidence">--</dd></div>
+                <div><dt>置信度</dt><dd id="thirdPartyChartConfidence">--</dd></div>
               </dl>
-              <p id="thirdPartySummary">等待第三方API返回。</p>
+              <p id="thirdPartyChartSummary">等待第三方API返回。</p>
               <div class="lists">
                 <div>
                   <h3>依据</h3>
-                  <ul id="thirdPartyReasons"></ul>
+                  <ul id="thirdPartyChartReasons"></ul>
                 </div>
                 <div>
                   <h3>风险</h3>
-                  <ul id="thirdPartyRisks"></ul>
+                  <ul id="thirdPartyChartRisks"></ul>
+                </div>
+              </div>
+              <h4>实时微观结构分析</h4>
+              <div class="third-party-engine-line">
+                <span id="thirdPartyMicroSymbol" class="third-party-symbol">--</span>
+                <span id="thirdPartyMicroEngine">--</span>
+              </div>
+              <div id="thirdPartyMicroNotice" class="openai-notice" hidden></div>
+              <div id="thirdPartyMicroDirection" class="direction neutral">--</div>
+              <dl class="metrics third-party-metrics micro-metrics">
+                <div><dt>动作 / 分数</dt><dd id="thirdPartyMicroAction">--</dd></div>
+                <div><dt>信号</dt><dd id="thirdPartyMicroSignal">--</dd></div>
+                <div><dt>30秒机会</dt><dd id="thirdPartyMicroOpportunity">--</dd></div>
+                <div><dt>冰山订单</dt><dd id="thirdPartyMicroIceberg">--</dd></div>
+                <div><dt>机构行为</dt><dd id="thirdPartyMicroInstitution">--</dd></div>
+                <div><dt>触发 / 失效</dt><dd id="thirdPartyMicroTrigger">--</dd></div>
+              </dl>
+              <p id="thirdPartyMicroSummary">等待第三方API返回。</p>
+              <div class="lists">
+                <div>
+                  <h3>依据</h3>
+                  <ul id="thirdPartyMicroReasons"></ul>
+                </div>
+                <div>
+                  <h3>风险</h3>
+                  <ul id="thirdPartyMicroRisks"></ul>
                 </div>
               </div>
             </div>
@@ -255,6 +285,7 @@
       </section>
     </main>
 
-    <script src="/app.js" type="module"></script>
+    <script src="/app.js?v=20260611-third-party-micro-grid" type="module"></script>/*这是版本*/
+  
   </body>
 </html>

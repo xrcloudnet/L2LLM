@@ -1,9 +1,14 @@
 # Local runtime databases and cache files.
+data/
 data/*.db
 data/*.db-*
 data/*.duckdb
 data/*.duckdb.*
+*.ps1
 
 # Python/runtime caches.
-__pycache__/
+backend/__pycache__/
+/backend/analysis/__pycache__/
+/backend/analysis/providers/__pycache__/
+/L2LLM-clean/
 *.py[cod]
